@@ -97,7 +97,7 @@ impl SamplingPlan {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct PreviewRequest {
     pub(crate) path: PathBuf,
     pub(crate) rect: Rect,
@@ -116,6 +116,7 @@ pub(crate) struct RenderJob {
 #[derive(Debug)]
 pub(crate) struct RenderResult {
     pub(crate) request: PreviewRequest,
+    pub(crate) generation: u64,
     pub(crate) result: Result<PreviewBitmap>,
 }
 
@@ -755,7 +756,7 @@ pub(crate) fn save_png(
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct Rect {
     pub(crate) x: u32,
     pub(crate) y: u32,

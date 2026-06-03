@@ -64,7 +64,7 @@ enum Command {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ValueEnum)]
 pub(crate) enum Backend {
     Auto,
     Libtiff,

@@ -78,6 +78,8 @@ The GUI contains a classic `File` menu:
 - `File > Quit` closes the application.
 
 The top toolbar also includes a path field, `Browse`, `Fit`, zoom out, and zoom in controls.
+Additional viewer controls include `Fit Width`, `1:1` actual-size zoom, a zoom percentage readout,
+recent files under the `File` menu, and a bottom status bar with tile loading/cache details.
 
 ## CLI Commands
 
@@ -201,18 +203,20 @@ faster path without a color transform.
 
 ## Performance Notes
 
-The GUI renders visible image content as source-aligned tile textures. Missing tiles are rendered on
-the worker thread and inserted incrementally, so panning can reuse tiles that are already in memory
+The GUI renders visible image content as source-aligned tile textures. Missing tiles are rendered by
+a small worker pool and inserted incrementally, so panning can reuse tiles that are already in memory
 instead of redrawing the full viewport. Rendered tile textures are kept in a 384 MiB LRU cache.
-Once all visible tiles are ready, the GUI opportunistically prefetches the nearest one-tile ring
-around the viewport. Visible tiles always stay higher priority than prefetch work.
+Visible missing tiles are scheduled by distance from the viewport center, so the most important part
+of the image appears first. Once all visible tiles are ready, the GUI opportunistically prefetches the
+nearest one-tile ring around the viewport. Visible tiles always stay higher priority than prefetch
+work.
 
-The render worker coalesces queued viewport/tile requests and uses a generation token so outdated
-renders can stop while the user is still panning or zooming. Rendered bitmaps are stored in an `Arc`
-until they are uploaded as GUI textures, so applying a finished render no longer copies the full RGBA
-buffer.
+Each render worker has its own source-row cache and its own single-threaded TIFF decode path. Jobs use
+a generation token so outdated renders can stop while the user is still panning or zooming. Rendered
+bitmaps are stored in an `Arc` until they are uploaded as GUI textures, so applying a finished render
+no longer copies the full RGBA buffer.
 
-The worker also keeps a 128 MiB LRU cache of raw source-row segments for both libtiff scanlines and
+Each worker also keeps a 128 MiB LRU cache of raw source-row segments for both libtiff scanlines and
 direct raw-strip reads. Repeated viewport renders can reuse already-read source rows before applying
 sampling and color conversion. The GUI/CLI timing label reports row cache hits when that worker cache
 is used.
@@ -250,16 +254,16 @@ For a 2048 x 2048 source viewport exported as a 512 x 512 PNG:
 
 ```text
 mapa2.tif auto:
-raw strip reads + lcms2 ICC, total 14.9 ms, read 3.3 ms, convert 5.9 ms
+raw strip reads + lcms2 ICC, total 16.1 ms, read 3.8 ms, convert 5.1 ms, png Fast 3.1 ms
 
 mapa2.tif --backend libtiff:
-libtiff scanlines + lcms2 ICC, total 72.5 ms, read 45.4 ms, convert 6.0 ms
+libtiff scanlines + lcms2 ICC, total 74.5 ms, read 44.3 ms, convert 4.3 ms, png Fast 4.9 ms
 
 mapa2_no_xmp_clean.tif auto:
-raw strip reads, total 2.8-3.0 ms, read 2.3-2.4 ms, convert 0.1-0.2 ms
+raw strip reads, total 3.4 ms, read 2.7 ms, convert 0.3 ms, png Fast 2.9 ms
 
 mapa2_no_xmp_clean.tif --backend libtiff:
-libtiff scanlines, total 32.0 ms, read 22.6 ms, convert 0.7 ms
+libtiff scanlines, total 30.8 ms, read 22.4 ms, convert 0.2 ms, png Fast 3.0 ms
 ```
 
 PNG compression comparison on `mapa2_no_xmp_clean.tif`, 512 x 512 output:
@@ -275,11 +279,16 @@ Parallel ICC row conversion on `mapa2.tif`, 4096 x 4096 source viewport exported
 
 ```text
 RAYON_NUM_THREADS=1:
-total 121.8 ms, read 19.7 ms, convert 91.1 ms, png Fast 27.2 ms
+total 115.2 ms, read 16.7 ms, convert 87.8 ms, png Fast 27.5 ms
 
 default rayon thread pool:
-total 72.7 ms, read 19.0 ms, convert 28.1 ms, png Fast 28.5 ms
+total 69.2 ms, read 17.4 ms, convert 25.3 ms, png Fast 28.9 ms
 ```
+
+The GUI tile worker pool is not directly represented by these CLI preview timings. In the viewer, the
+benefit is interactive: up to four independent tile jobs can be in flight, each with its own
+single-threaded TIFF decode path and source-row cache, while the scheduler prioritizes missing tiles
+closest to the center of the viewport before filling edges and prefetching nearby tiles.
 
 PGO release build after running the representative preview workloads below:
 
@@ -342,18 +351,19 @@ cargo build --release
 - reads viewports through `TIFFReadScanline` in the `libtiff` backend,
 - prefers direct raw-strip reads for suitable uncompressed stripped TIFFs in `auto` mode,
 - applies embedded ICC profiles through `lcms2` where supported,
-- reports preview timing in the CLI and GUI status overlay,
+- reports preview timing in the CLI and GUI status bar,
 - renders GUI viewports from cached source-aligned tile textures,
+- schedules missing GUI tiles by distance from the viewport center,
 - prefetches nearby GUI tiles after the visible viewport is cached,
 - cancels outdated GUI render work when a newer viewport request arrives,
-- caches recently used source-row segments inside the GUI render worker,
+- caches recently used source-row segments inside each GUI render worker,
 - keeps a 384 MiB LRU cache of rendered GUI tile textures,
 - uses a direct no-ICC row conversion fast path for common RGB/Gray/RGBA TIFFs,
 - parallelizes ICC-managed row conversion with `rayon` while keeping file reads single-threaded,
 - uses fast PNG compression by default for lower export latency,
 - can directly seek through uncompressed stripped RGB/Gray TIFFs as a fallback,
 - can decode additional supported strip/tile TIFFs through the Rust `tiff` crate fallback,
-- renders GUI viewports on a worker thread,
+- renders GUI viewport tiles through a small worker pool,
 - exports the current viewport as RGBA PNG.
 
 ## Sample Files
@@ -368,6 +378,8 @@ need to allocate roughly the whole image, which is exactly the memory pressure t
 
 Useful next optimization steps:
 
-- add a lower-resolution overview/pyramid layer for very fast fit-to-window previews,
-- tune tile sizing and eviction with more GUI interaction benchmarks,
-- explore SIMD-friendly sampling/conversion paths for common non-ICC RGB8/RGBA8 images.
+- add an optional persistent overview/thumbnail cache for very fast first-window previews,
+- add automated GUI interaction benchmarks for pan/zoom/tile warm-cache scenarios,
+- tune tile sizing, worker count, and eviction policy from those GUI benchmarks,
+- explore explicit SIMD sampling/conversion paths for common non-ICC RGB8/RGBA8 images,
+- continue Linux and macOS runtime validation, packaging, and file-dialog checks.

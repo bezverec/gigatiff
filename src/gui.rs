@@ -1,7 +1,10 @@
+use std::collections::HashSet;
+use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use anyhow::{Result, anyhow};
@@ -17,6 +20,8 @@ use crate::tiff_info::{ImageInfo, load_info};
 
 const GUI_TILE_SIZE: f32 = 384.0;
 const GUI_PREFETCH_TILE_RADIUS: u32 = 1;
+const GUI_RENDER_WORKERS_MAX: usize = 4;
+const RECENT_FILE_LIMIT: usize = 8;
 
 struct VisibleTile {
     request: PreviewRequest,
@@ -24,20 +29,33 @@ struct VisibleTile {
     uv_rect: egui::Rect,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    Free,
+    FitImage,
+    FitWidth,
+    ActualSize,
+}
+
 struct ViewerApp {
     path_input: String,
     path: Option<PathBuf>,
     info: Option<ImageInfo>,
     last_request: Option<PreviewRequest>,
-    pending_request: Option<PreviewRequest>,
+    pending_requests: HashSet<PreviewRequest>,
     render_tx: Sender<RenderJob>,
     render_rx: Receiver<RenderResult>,
+    render_worker_count: usize,
     render_generation: u64,
     latest_generation: Arc<AtomicU64>,
     tile_cache: TileTextureCache,
     texture_serial: u64,
     status: String,
     source_label: String,
+    loading_label: String,
+    recent_files: Vec<PathBuf>,
+    view_mode: ViewMode,
+    last_canvas_size: egui::Vec2,
     center_x: f64,
     center_y: f64,
     view_width: f64,
@@ -46,6 +64,8 @@ struct ViewerApp {
 }
 
 pub(crate) fn run_gui(path: Option<PathBuf>) -> Result<()> {
+    hide_windows_console_for_gui();
+
     let native_options = eframe::NativeOptions::default();
     eframe::run_native(
         "GigaTIFF",
@@ -55,49 +75,80 @@ pub(crate) fn run_gui(path: Option<PathBuf>) -> Result<()> {
     .map_err(|err| anyhow!("GUI error: {err}"))
 }
 
-fn spawn_render_worker(
+fn spawn_render_workers(
     ctx: egui::Context,
     latest_generation: Arc<AtomicU64>,
+    worker_count: usize,
 ) -> (Sender<RenderJob>, Receiver<RenderResult>) {
     let (job_tx, job_rx) = mpsc::channel::<RenderJob>();
     let (result_tx, result_rx) = mpsc::channel::<RenderResult>();
+    let job_rx = Arc::new(Mutex::new(job_rx));
 
-    thread::spawn(move || {
-        let mut scanline_cache = ScanlineCache::new(128 * 1024 * 1024);
-        while let Ok(mut job) = job_rx.recv() {
-            while let Ok(newer) = job_rx.try_recv() {
-                job = newer;
-            }
+    for worker_index in 0..worker_count {
+        let ctx = ctx.clone();
+        let job_rx = Arc::clone(&job_rx);
+        let result_tx = result_tx.clone();
+        let latest_generation = Arc::clone(&latest_generation);
 
-            let cancel = RenderCancel {
-                latest_generation: Arc::clone(&latest_generation),
-                generation: job.generation,
-            };
-            let result = render_preview(
-                &job.request.path,
-                &job.info,
-                job.request.rect,
-                job.request.max_output,
-                job.max_chunk_mb,
-                job.request.backend,
-                Some(&cancel),
-                Some(&mut scanline_cache),
-            );
+        let _ = thread::Builder::new()
+            .name(format!("gigatiff-render-{worker_index}"))
+            .spawn(move || {
+                let mut scanline_cache = ScanlineCache::new(128 * 1024 * 1024);
+                loop {
+                    let job = match job_rx.lock() {
+                        Ok(receiver) => receiver.recv(),
+                        Err(_) => break,
+                    };
+                    let Ok(job) = job else {
+                        break;
+                    };
 
-            if result_tx
-                .send(RenderResult {
-                    request: job.request,
-                    result,
-                })
-                .is_err()
-            {
-                break;
-            }
-            ctx.request_repaint();
-        }
-    });
+                    if latest_generation.load(Ordering::Relaxed) != job.generation {
+                        continue;
+                    }
+
+                    let cancel = RenderCancel {
+                        latest_generation: Arc::clone(&latest_generation),
+                        generation: job.generation,
+                    };
+                    let result = render_preview(
+                        &job.request.path,
+                        &job.info,
+                        job.request.rect,
+                        job.request.max_output,
+                        job.max_chunk_mb,
+                        job.request.backend,
+                        Some(&cancel),
+                        Some(&mut scanline_cache),
+                    );
+
+                    if result_tx
+                        .send(RenderResult {
+                            request: job.request,
+                            generation: job.generation,
+                            result,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                    ctx.request_repaint();
+                }
+            });
+    }
 
     (job_tx, result_rx)
+}
+
+fn gui_render_worker_count() -> usize {
+    thread::available_parallelism()
+        .map(|threads| {
+            threads
+                .get()
+                .saturating_sub(1)
+                .clamp(1, GUI_RENDER_WORKERS_MAX)
+        })
+        .unwrap_or(1)
 }
 
 impl ViewerApp {
@@ -105,7 +156,9 @@ impl ViewerApp {
         let fallback = PathBuf::from("mapa2.tif");
         let initial = path.or_else(|| fallback.exists().then_some(fallback));
         let latest_generation = Arc::new(AtomicU64::new(0));
-        let (render_tx, render_rx) = spawn_render_worker(ctx, Arc::clone(&latest_generation));
+        let render_worker_count = gui_render_worker_count();
+        let (render_tx, render_rx) =
+            spawn_render_workers(ctx, Arc::clone(&latest_generation), render_worker_count);
         let mut app = Self {
             path_input: initial
                 .as_ref()
@@ -114,15 +167,20 @@ impl ViewerApp {
             path: None,
             info: None,
             last_request: None,
-            pending_request: None,
+            pending_requests: HashSet::new(),
             render_tx,
             render_rx,
+            render_worker_count,
             render_generation: 0,
             latest_generation,
             tile_cache: TileTextureCache::new(384 * 1024 * 1024),
             texture_serial: 0,
             status: "Ready".to_string(),
             source_label: String::new(),
+            loading_label: String::new(),
+            recent_files: load_recent_files(),
+            view_mode: ViewMode::FitImage,
+            last_canvas_size: egui::Vec2::ZERO,
             center_x: 0.0,
             center_y: 0.0,
             view_width: 1024.0,
@@ -144,13 +202,16 @@ impl ViewerApp {
                 self.center_x = info.width as f64 / 2.0;
                 self.center_y = info.height as f64 / 2.0;
                 self.view_width = info.width as f64;
+                self.view_mode = ViewMode::FitImage;
                 self.status = format!("Opened {}", path.display());
+                self.remember_recent_file(path.clone());
                 self.path = Some(path);
                 self.info = Some(info);
                 self.last_request = None;
-                self.pending_request = None;
+                self.invalidate_render_jobs();
                 self.tile_cache.clear();
                 self.source_label.clear();
+                self.loading_label.clear();
             }
             Err(err) => {
                 self.status = format!("Open failed: {err:#}");
@@ -163,6 +224,25 @@ impl ViewerApp {
             self.center_x = info.width as f64 / 2.0;
             self.center_y = info.height as f64 / 2.0;
             self.view_width = info.width as f64;
+            self.view_mode = ViewMode::FitImage;
+            self.last_request = None;
+        }
+    }
+
+    fn fit_width(&mut self) {
+        if let Some(info) = &self.info {
+            self.center_x = info.width as f64 / 2.0;
+            self.view_width = info.width as f64;
+            self.view_mode = ViewMode::FitWidth;
+            self.last_request = None;
+        }
+    }
+
+    fn actual_size(&mut self, canvas_size: egui::Vec2, pixels_per_point: f32) {
+        if let Some(info) = &self.info {
+            self.view_width =
+                (canvas_size.x.max(1.0) * pixels_per_point).clamp(32.0, info.width as f32) as f64;
+            self.view_mode = ViewMode::ActualSize;
             self.last_request = None;
         }
     }
@@ -170,26 +250,37 @@ impl ViewerApp {
     fn zoom(&mut self, factor: f64) {
         if let Some(info) = &self.info {
             self.view_width = (self.view_width * factor).clamp(32.0, info.width as f64);
+            self.view_mode = ViewMode::Free;
             self.last_request = None;
         }
     }
 
+    fn remember_recent_file(&mut self, path: PathBuf) {
+        self.recent_files.retain(|item| item != &path);
+        self.recent_files.insert(0, path);
+        self.recent_files.truncate(RECENT_FILE_LIMIT);
+        let _ = save_recent_files(&self.recent_files);
+    }
+
+    fn open_recent_file(&mut self, path: PathBuf) {
+        self.path_input = path.display().to_string();
+        self.open_current_path();
+    }
+
     fn drain_render_results(&mut self, ctx: &egui::Context) {
         while let Ok(rendered) = self.render_rx.try_recv() {
+            if rendered.generation != self.latest_generation.load(Ordering::Relaxed) {
+                continue;
+            }
+            self.pending_requests.remove(&rendered.request);
+
             match rendered.result {
                 Ok(bitmap) => {
                     let bitmap = Arc::new(bitmap);
-
-                    if self.pending_request.as_ref() == Some(&rendered.request) {
-                        self.insert_tile_texture(ctx, rendered.request, &bitmap);
-                        self.pending_request = None;
-                    }
+                    self.insert_tile_texture(ctx, rendered.request, &bitmap);
                 }
                 Err(err) => {
-                    if self.pending_request.as_ref() == Some(&rendered.request) {
-                        self.status = format!("Render failed: {err:#}");
-                        self.pending_request = None;
-                    }
+                    self.status = format!("Render failed: {err:#}");
                 }
             }
         }
@@ -223,14 +314,17 @@ impl ViewerApp {
         ctx.request_repaint();
     }
 
-    fn queue_render(&mut self, request: PreviewRequest, info: &ImageInfo, status: String) {
-        if self.pending_request.as_ref() == Some(&request) {
-            return;
-        }
-
+    fn invalidate_render_jobs(&mut self) {
         self.render_generation = self.render_generation.wrapping_add(1);
         self.latest_generation
             .store(self.render_generation, Ordering::Relaxed);
+        self.pending_requests.clear();
+    }
+
+    fn queue_render(&mut self, request: PreviewRequest, info: &ImageInfo, status: String) -> bool {
+        if self.pending_requests.contains(&request) {
+            return false;
+        }
 
         let send_result = self.render_tx.send(RenderJob {
             request: request.clone(),
@@ -240,10 +334,12 @@ impl ViewerApp {
         });
 
         if send_result.is_ok() {
-            self.pending_request = Some(request);
+            self.pending_requests.insert(request);
             self.status = status;
+            true
         } else {
             self.status = "Render worker stopped".to_string();
+            false
         }
     }
 
@@ -320,6 +416,21 @@ impl ViewerApp {
 
                 ui.separator();
 
+                ui.menu_button("Recent Files", |ui| {
+                    if self.recent_files.is_empty() {
+                        ui.add_enabled(false, egui::Button::new("No recent files"));
+                    } else {
+                        for path in self.recent_files.clone() {
+                            if ui.button(path.display().to_string()).clicked() {
+                                ui.close();
+                                self.open_recent_file(path);
+                            }
+                        }
+                    }
+                });
+
+                ui.separator();
+
                 let can_export = self.last_request.is_some();
                 if ui
                     .add_enabled(can_export, egui::Button::new("Export as PNG..."))
@@ -339,6 +450,46 @@ impl ViewerApp {
         });
     }
 
+    fn zoom_label(&self, info: &ImageInfo, pixels_per_point: f32) -> String {
+        let canvas_size = if self.last_canvas_size.x > 0.0 && self.last_canvas_size.y > 0.0 {
+            self.last_canvas_size
+        } else {
+            egui::vec2(1024.0, 768.0)
+        };
+        let rect = self.current_rect(info, canvas_size);
+        let zoom = canvas_size.x.max(1.0) * pixels_per_point / rect.width.max(1) as f32 * 100.0;
+        format!("{zoom:.0}%")
+    }
+
+    fn mode_label(&self) -> &'static str {
+        match self.view_mode {
+            ViewMode::Free => "Free",
+            ViewMode::FitImage => "Fit Image",
+            ViewMode::FitWidth => "Fit Width",
+            ViewMode::ActualSize => "Actual Size",
+        }
+    }
+
+    fn status_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.horizontal_wrapped(|ui| {
+            if !self.pending_requests.is_empty() {
+                ui.add(egui::Spinner::new());
+            }
+            ui.label(&self.status);
+
+            if let Some(info) = &self.info {
+                ui.separator();
+                ui.label(self.mode_label());
+                ui.separator();
+                ui.label(self.zoom_label(info, ctx.pixels_per_point()));
+                ui.separator();
+                ui.label(&self.loading_label);
+                ui.separator();
+                ui.label(&self.source_label);
+            }
+        });
+    }
+
     fn render_canvas(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         self.drain_render_results(ctx);
 
@@ -347,6 +498,7 @@ impl ViewerApp {
             return;
         }
         let (canvas, response) = ui.allocate_exact_size(available, egui::Sense::drag());
+        self.last_canvas_size = canvas.size();
         let painter = ui.painter_at(canvas);
         painter.rect_filled(canvas, 0.0, egui::Color32::from_rgb(28, 30, 31));
 
@@ -367,6 +519,7 @@ impl ViewerApp {
             let view = self.current_rect(&info, canvas.size());
             self.center_x -= delta.x as f64 * view.width as f64 / canvas.width() as f64;
             self.center_y -= delta.y as f64 * view.height as f64 / canvas.height() as f64;
+            self.view_mode = ViewMode::Free;
             self.last_request = None;
         } else {
             self.last_drag_delta = egui::Vec2::ZERO;
@@ -389,6 +542,9 @@ impl ViewerApp {
             max_output,
             backend: Backend::Auto,
         };
+        if self.last_request.as_ref() != Some(&request) {
+            self.invalidate_render_jobs();
+        }
         self.last_request = Some(request);
 
         let tiles = visible_tile_requests(
@@ -401,7 +557,7 @@ impl ViewerApp {
         );
         let total_tiles = tiles.len();
         let mut rendered_tiles = 0usize;
-        let mut missing_tile = None;
+        let mut missing_tiles = Vec::new();
         let mut latest_tile_label = None;
 
         for tile in tiles {
@@ -420,31 +576,53 @@ impl ViewerApp {
                     tile.uv_rect,
                     egui::Color32::WHITE,
                 );
-            } else if missing_tile.is_none() {
-                missing_tile = Some(tile.request);
+            } else {
+                missing_tiles.push((tile_priority(tile.request.rect, source_rect), tile.request));
             }
         }
 
-        if let Some(tile_request) = missing_tile {
-            if self.pending_request.as_ref() != Some(&tile_request) {
-                self.queue_render(
+        missing_tiles.sort_by_key(|(priority, _)| *priority);
+
+        let missing_tile_count = missing_tiles.len();
+        if missing_tile_count > 0 {
+            let mut slots = self
+                .render_worker_count
+                .saturating_sub(self.pending_requests.len());
+            let mut queued_tiles = 0usize;
+
+            for (_, tile_request) in missing_tiles {
+                if slots == 0 {
+                    break;
+                }
+                if self.pending_requests.contains(&tile_request) {
+                    continue;
+                }
+
+                if self.queue_render(
                     tile_request.clone(),
                     &info,
                     format!(
-                        "Rendering tile {}/{} for x={} y={} w={} h={}...",
-                        rendered_tiles + 1,
+                        "Rendering visible tiles {}/{} with {} workers (x={} y={} w={} h={})...",
+                        rendered_tiles + queued_tiles + 1,
                         total_tiles,
+                        self.render_worker_count,
                         tile_request.rect.x,
                         tile_request.rect.y,
                         tile_request.rect.width,
                         tile_request.rect.height
                     ),
-                );
+                ) {
+                    queued_tiles += 1;
+                    slots = slots.saturating_sub(1);
+                }
             }
         } else if total_tiles > 0 {
             let mut prefetch_queued = false;
+            let mut slots = self
+                .render_worker_count
+                .saturating_sub(self.pending_requests.len());
 
-            if self.pending_request.is_none() {
+            if slots > 0 {
                 for tile_request in prefetch_tile_requests(
                     &path,
                     &info,
@@ -453,25 +631,32 @@ impl ViewerApp {
                     ctx.pixels_per_point(),
                     Backend::Auto,
                 ) {
-                    if !self.tile_cache.contains(&tile_request) {
-                        self.queue_render(
+                    if slots == 0 {
+                        break;
+                    }
+                    if !self.tile_cache.contains(&tile_request)
+                        && !self.pending_requests.contains(&tile_request)
+                    {
+                        if self.queue_render(
                             tile_request.clone(),
                             &info,
                             format!(
-                                "Prefetching tile x={} y={} w={} h={}...",
+                                "Prefetching nearby tiles with {} workers (x={} y={} w={} h={})...",
+                                self.render_worker_count,
                                 tile_request.rect.x,
                                 tile_request.rect.y,
                                 tile_request.rect.width,
                                 tile_request.rect.height
                             ),
-                        );
-                        prefetch_queued = true;
-                        break;
+                        ) {
+                            prefetch_queued = true;
+                            slots = slots.saturating_sub(1);
+                        }
                     }
                 }
             }
 
-            if !prefetch_queued {
+            if !prefetch_queued && self.pending_requests.is_empty() {
                 self.status = format!(
                     "Viewport x={} y={} w={} h={} (tiles cached)",
                     source_rect.x, source_rect.y, source_rect.width, source_rect.height
@@ -489,6 +674,19 @@ impl ViewerApp {
                 .map(|label| format!(", {label}"))
                 .unwrap_or_default()
         );
+        self.loading_label = if rendered_tiles < total_tiles {
+            format!(
+                "Loading tiles {rendered_tiles}/{total_tiles}, in flight {}",
+                self.pending_requests.len()
+            )
+        } else if !self.pending_requests.is_empty() {
+            format!(
+                "Prefetching nearby tiles, in flight {}",
+                self.pending_requests.len()
+            )
+        } else {
+            "Tiles ready".to_string()
+        };
 
         if rendered_tiles > 0 {
             painter.rect_stroke(
@@ -498,14 +696,6 @@ impl ViewerApp {
                 egui::StrokeKind::Inside,
             );
         }
-
-        painter.text(
-            canvas.left_top() + egui::vec2(10.0, 10.0),
-            egui::Align2::LEFT_TOP,
-            &self.source_label,
-            egui::FontId::monospace(12.0),
-            egui::Color32::WHITE,
-        );
 
         if rendered_tiles == 0 {
             painter.text(
@@ -519,7 +709,7 @@ impl ViewerApp {
     }
 
     fn current_rect(&self, info: &ImageInfo, canvas_size: egui::Vec2) -> Rect {
-        if self.view_width >= info.width as f64 - 0.5 {
+        if self.view_mode == ViewMode::FitImage {
             return Rect {
                 x: 0,
                 y: 0,
@@ -529,7 +719,12 @@ impl ViewerApp {
         }
 
         let aspect = (canvas_size.x.max(1.0) / canvas_size.y.max(1.0)) as f64;
-        let mut width = self.view_width.clamp(1.0, info.width as f64);
+        let mut width = match self.view_mode {
+            ViewMode::FitImage => info.width as f64,
+            ViewMode::FitWidth => info.width as f64,
+            ViewMode::ActualSize | ViewMode::Free => self.view_width,
+        }
+        .clamp(1.0, info.width as f64);
         let mut height = width / aspect;
 
         if height > info.height as f64 {
@@ -573,13 +768,27 @@ impl eframe::App for ViewerApp {
                 if ui.button("Fit").clicked() {
                     self.fit_view();
                 }
+                if ui.button("Fit Width").clicked() {
+                    self.fit_width();
+                }
+                if ui.button("1:1").clicked() {
+                    let canvas_size =
+                        if self.last_canvas_size.x > 0.0 && self.last_canvas_size.y > 0.0 {
+                            self.last_canvas_size
+                        } else {
+                            ui.available_size()
+                        };
+                    self.actual_size(canvas_size, ctx.pixels_per_point());
+                }
                 if ui.button("-").clicked() {
                     self.zoom(1.25);
                 }
                 if ui.button("+").clicked() {
                     self.zoom(0.8);
                 }
-                ui.label(&self.status);
+                if let Some(info) = &self.info {
+                    ui.label(self.zoom_label(info, ctx.pixels_per_point()));
+                }
             });
 
             if let Some(info) = &self.info {
@@ -603,6 +812,10 @@ impl eframe::App for ViewerApp {
                     });
                 });
             }
+        });
+
+        egui::Panel::bottom("status_bar").show_inside(ui, |ui| {
+            self.status_bar(ui, &ctx);
         });
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
@@ -692,6 +905,16 @@ fn visible_tile_requests(
     tiles
 }
 
+fn tile_priority(tile_rect: Rect, source_rect: Rect) -> u128 {
+    let view_center_x = source_rect.x as i128 + source_rect.width as i128 / 2;
+    let view_center_y = source_rect.y as i128 + source_rect.height as i128 / 2;
+    let tile_center_x = tile_rect.x as i128 + tile_rect.width as i128 / 2;
+    let tile_center_y = tile_rect.y as i128 + tile_rect.height as i128 / 2;
+    let dx = tile_center_x - view_center_x;
+    let dy = tile_center_y - view_center_y;
+    (dx * dx + dy * dy) as u128
+}
+
 fn prefetch_tile_requests(
     path: &Path,
     info: &ImageInfo,
@@ -713,8 +936,6 @@ fn prefetch_tile_requests(
     let prefetch_start_y = visible_start_y.saturating_sub(radius_h);
     let prefetch_end_x = visible_end_x.saturating_add(radius_w);
     let prefetch_end_y = visible_end_y.saturating_add(radius_h);
-    let view_center_x = source_rect.x as i128 + source_rect.width as i128 / 2;
-    let view_center_y = source_rect.y as i128 + source_rect.height as i128 / 2;
     let mut requests = Vec::new();
     let mut tile_y = prefetch_start_y;
 
@@ -736,22 +957,18 @@ fn prefetch_tile_requests(
                 let max_output = (full_tile_screen_w.max(full_tile_screen_h) * pixels_per_point)
                     .round()
                     .clamp(128.0, 768.0) as u32;
-                let tile_center_x = tile_x as i128 + tile_w as i128 / 2;
-                let tile_center_y = tile_y as i128 + tile_h as i128 / 2;
-                let dx = tile_center_x - view_center_x;
-                let dy = tile_center_y - view_center_y;
-                let priority = (dx * dx + dy * dy) as u128;
+                let rect = Rect {
+                    x: tile_x,
+                    y: tile_y,
+                    width: tile_w,
+                    height: tile_h,
+                };
 
                 requests.push((
-                    priority,
+                    tile_priority(rect, source_rect),
                     PreviewRequest {
                         path: path.to_path_buf(),
-                        rect: Rect {
-                            x: tile_x,
-                            y: tile_y,
-                            width: tile_w,
-                            height: tile_h,
-                        },
+                        rect,
                         max_output,
                         backend,
                     },
@@ -775,6 +992,91 @@ fn gui_tile_shape(source_rect: Rect, canvas: egui::Rect) -> (u32, u32, u32, u32)
     let tile_source_h = source_rect.height.div_ceil(rows).max(1);
     (cols, rows, tile_source_w, tile_source_h)
 }
+
+fn load_recent_files() -> Vec<PathBuf> {
+    let Some(path) = recent_files_path() else {
+        return Vec::new();
+    };
+    let Ok(text) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+
+    let mut files = Vec::new();
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let path = PathBuf::from(line);
+        if !files.contains(&path) {
+            files.push(path);
+        }
+        if files.len() >= RECENT_FILE_LIMIT {
+            break;
+        }
+    }
+    files
+}
+
+fn save_recent_files(files: &[PathBuf]) -> Result<()> {
+    let Some(path) = recent_files_path() else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let text = files
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(path, text)?;
+    Ok(())
+}
+
+fn recent_files_path() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        return env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .map(|dir| dir.join("GigaTIFF").join("recent-files.txt"));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        return env::var_os("HOME").map(PathBuf::from).map(|dir| {
+            dir.join("Library")
+                .join("Application Support")
+                .join("GigaTIFF")
+                .join("recent-files.txt")
+        });
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if let Some(config_home) = env::var_os("XDG_CONFIG_HOME").map(PathBuf::from) {
+            return Some(config_home.join("gigatiff").join("recent-files.txt"));
+        }
+        return env::var_os("HOME").map(PathBuf::from).map(|dir| {
+            dir.join(".config")
+                .join("gigatiff")
+                .join("recent-files.txt")
+        });
+    }
+
+    #[allow(unreachable_code)]
+    None
+}
+
+#[cfg(all(target_os = "windows", not(debug_assertions)))]
+fn hide_windows_console_for_gui() {
+    unsafe extern "system" {
+        fn FreeConsole() -> i32;
+    }
+
+    unsafe {
+        FreeConsole();
+    }
+}
+
+#[cfg(not(all(target_os = "windows", not(debug_assertions))))]
+fn hide_windows_console_for_gui() {}
 
 #[cfg(test)]
 mod tests {
@@ -848,5 +1150,37 @@ mod tests {
             assert!(request.rect.x + request.rect.width <= info.width);
             assert!(request.rect.y + request.rect.height <= info.height);
         }
+    }
+
+    #[test]
+    fn tile_priority_prefers_viewport_center() {
+        let info = dummy_info(4096, 4096);
+        let source_rect = Rect {
+            x: 0,
+            y: 0,
+            width: 2048,
+            height: 2048,
+        };
+        let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1024.0, 1024.0));
+        let path = Path::new("sample.tif");
+        let visible = visible_tile_requests(path, &info, source_rect, canvas, 1.0, Backend::Auto);
+
+        let first_by_iteration = visible.first().expect("visible tile").request.rect;
+        let first_by_priority = visible
+            .iter()
+            .min_by_key(|tile| tile_priority(tile.request.rect, source_rect))
+            .expect("priority tile")
+            .request
+            .rect;
+
+        assert_ne!(first_by_priority, first_by_iteration);
+        assert_eq!(
+            tile_priority(first_by_priority, source_rect),
+            visible
+                .iter()
+                .map(|tile| tile_priority(tile.request.rect, source_rect))
+                .min()
+                .expect("minimum priority")
+        );
     }
 }
