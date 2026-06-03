@@ -194,7 +194,17 @@ jobs:
       - name: Upload GitHub Release assets
         uses: softprops/action-gh-release@v2
         with:
+          name: GigaTIFF ${{ github.ref_name }}
           draft: false
           prerelease: true
-          generate_release_notes: true
+          body: |
+            First prerelease build of GigaTIFF.
+
+            Included archives:
+
+            - `gigatiff-${{ github.ref_name }}-windows-x64.zip` with `gigatiff.exe` and required vcpkg DLLs.
+            - `gigatiff-${{ github.ref_name }}-linux-x64.zip` with the Linux binary and a `GigaTIFF.desktop` launcher.
+            - `gigatiff-${{ github.ref_name }}-macos.zip` with the macOS binary and a `GigaTIFF.app` bundle for Finder launch.
+
+            Source code archives are provided automatically by GitHub.
           files: dist/*.zip
