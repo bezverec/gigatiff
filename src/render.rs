@@ -13,7 +13,7 @@ use rayon::prelude::*;
 use tiff::ColorType;
 use tiff::decoder::{ChunkType, Decoder, DecodingResult};
 
-use crate::cache::{ScanlineCache, ScanlineKey};
+use crate::cache::{OverviewCacheKey, ScanlineCache, ScanlineKey};
 use crate::cli::{Backend, PngCompression};
 use crate::color::{ColorTransform, bits_for_color, samples_for_color, write_sampled_row_rgba};
 use crate::tiff_info::{ImageInfo, can_read_raw_strips, open_decoder};
@@ -111,13 +111,21 @@ pub(crate) struct RenderJob {
     pub(crate) info: ImageInfo,
     pub(crate) max_chunk_mb: usize,
     pub(crate) generation: u64,
+    pub(crate) kind: RenderJobKind,
 }
 
 #[derive(Debug)]
 pub(crate) struct RenderResult {
     pub(crate) request: PreviewRequest,
     pub(crate) generation: u64,
+    pub(crate) kind: RenderJobKind,
     pub(crate) result: Result<PreviewBitmap>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RenderJobKind {
+    Tile,
+    Overview(OverviewCacheKey),
 }
 
 pub(crate) struct RenderCancel {

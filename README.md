@@ -77,8 +77,8 @@ The GUI contains a classic `File` menu:
 - `File > Export as PNG...` re-renders the current viewport at a higher output size and saves it as PNG,
 - `File > Quit` closes the application.
 
-The top toolbar also includes a path field, `Browse`, `Fit`, zoom out, and zoom in controls.
-Additional viewer controls include `Fit Width`, `1:1` actual-size zoom, a zoom percentage readout,
+The top toolbar also includes a path field, `Browse`, aspect-preserving `Fit`, `1:1` actual-size
+zoom, zoom out, and zoom in controls. Additional viewer controls include a zoom percentage readout,
 recent files under the `File` menu, and a bottom status bar with tile loading/cache details.
 
 ## CLI Commands
@@ -221,6 +221,12 @@ direct raw-strip reads. Repeated viewport renders can reuse already-read source 
 sampling and color conversion. The GUI/CLI timing label reports row cache hits when that worker cache
 is used.
 
+The GUI also keeps a persistent full-image overview cache for fast first-window previews. The cached
+overview is an internal RGBA file keyed by the TIFF path, file size, modification time, dimensions,
+layout, and color metadata. It is drawn as a low-resolution background while higher-resolution tiles
+arrive. Cache files live under the platform cache directory, for example
+`%LOCALAPPDATA%\GigaTIFF\overview-cache` on Windows, and are pruned to roughly 256 MiB.
+
 In `auto` mode, uncompressed stripped TIFFs use the raw-strip path before libtiff. This avoids reading
 whole scanlines when the viewport only needs a narrow horizontal region.
 
@@ -231,7 +237,9 @@ reports basic timing for render, read/decode, conversion/blit, and PNG writing.
 
 For TIFFs without embedded ICC profiles, common RGB8/RGBA8/Gray8 and 16-bit variants use a direct
 sample-to-RGBA row path. This avoids the intermediate sampled-row buffer and per-pixel conversion
-dispatch used by the color-managed path.
+dispatch used by the color-managed path. On x86/x86_64, RGB8 and RGBA8 rows also use a small SSE2
+block writer that emits four sampled RGBA pixels at a time before finishing any tail pixels with the
+scalar fallback.
 
 For larger ICC-managed viewports, source rows are read sequentially and then sampled/color-converted
 in parallel row batches through `rayon`. File access and libtiff handles stay single-threaded; only
@@ -254,16 +262,16 @@ For a 2048 x 2048 source viewport exported as a 512 x 512 PNG:
 
 ```text
 mapa2.tif auto:
-raw strip reads + lcms2 ICC, total 16.1 ms, read 3.8 ms, convert 5.1 ms, png Fast 3.1 ms
+raw strip reads + lcms2 ICC, total 16.2 ms, read 4.0 ms, convert 4.0 ms, png Fast 3.1 ms
 
 mapa2.tif --backend libtiff:
-libtiff scanlines + lcms2 ICC, total 74.5 ms, read 44.3 ms, convert 4.3 ms, png Fast 4.9 ms
+libtiff scanlines + lcms2 ICC, total 75.7 ms, read 48.3 ms, convert 4.4 ms, png Fast 3.0 ms
 
 mapa2_no_xmp_clean.tif auto:
-raw strip reads, total 3.4 ms, read 2.7 ms, convert 0.3 ms, png Fast 2.9 ms
+raw strip reads + SSE2 RGB8 sampling, total 3.0 ms, read 2.3 ms, convert 0.3 ms, png Fast 2.8 ms
 
 mapa2_no_xmp_clean.tif --backend libtiff:
-libtiff scanlines, total 30.8 ms, read 22.4 ms, convert 0.2 ms, png Fast 3.0 ms
+libtiff scanlines + SSE2 RGB8 sampling, total 32.7 ms, read 23.6 ms, convert 0.3 ms, png Fast 2.4 ms
 ```
 
 PNG compression comparison on `mapa2_no_xmp_clean.tif`, 512 x 512 output:
@@ -279,10 +287,10 @@ Parallel ICC row conversion on `mapa2.tif`, 4096 x 4096 source viewport exported
 
 ```text
 RAYON_NUM_THREADS=1:
-total 115.2 ms, read 16.7 ms, convert 87.8 ms, png Fast 27.5 ms
+total 113.8 ms, read 16.4 ms, convert 87.0 ms, png Fast 29.2 ms
 
 default rayon thread pool:
-total 69.2 ms, read 17.4 ms, convert 25.3 ms, png Fast 28.9 ms
+total 69.7 ms, read 16.3 ms, convert 27.3 ms, png Fast 28.8 ms
 ```
 
 The GUI tile worker pool is not directly represented by these CLI preview timings. In the viewer, the
@@ -306,8 +314,8 @@ total 69.4 ms, read 18.0 ms, convert 26.7 ms, png Fast 25.9 ms
 ## PGO Build
 
 Profile-guided optimization is not enabled by default, but the project can be built with Rust/LLVM
-PGO when the Rust LLVM tools component is installed. The current local PGO profile data was
-regenerated after the no-ICC row fast path and is merged to `target/pgo/gigatiff-pgo.profdata`.
+PGO when the Rust LLVM tools component is installed. The commands below write merged profile data to
+`target/pgo/gigatiff-pgo.profdata`; regenerate it whenever the render hot paths change.
 
 ```powershell
 rustup component add llvm-tools-preview
@@ -358,7 +366,9 @@ cargo build --release
 - cancels outdated GUI render work when a newer viewport request arrives,
 - caches recently used source-row segments inside each GUI render worker,
 - keeps a 384 MiB LRU cache of rendered GUI tile textures,
+- keeps a persistent full-image overview cache for faster repeat opens,
 - uses a direct no-ICC row conversion fast path for common RGB/Gray/RGBA TIFFs,
+- uses an SSE2 block writer for no-ICC RGB8/RGBA8 sampled rows on x86/x86_64,
 - parallelizes ICC-managed row conversion with `rayon` while keeping file reads single-threaded,
 - uses fast PNG compression by default for lower export latency,
 - can directly seek through uncompressed stripped RGB/Gray TIFFs as a fallback,
@@ -378,8 +388,7 @@ need to allocate roughly the whole image, which is exactly the memory pressure t
 
 Useful next optimization steps:
 
-- add an optional persistent overview/thumbnail cache for very fast first-window previews,
 - add automated GUI interaction benchmarks for pan/zoom/tile warm-cache scenarios,
-- tune tile sizing, worker count, and eviction policy from those GUI benchmarks,
-- explore explicit SIMD sampling/conversion paths for common non-ICC RGB8/RGBA8 images,
+- tune tile sizing, worker count, overview-cache size, and eviction policy from those GUI benchmarks,
+- benchmark and tune the explicit SIMD RGB8/RGBA8 path against more sampling ratios,
 - continue Linux and macOS runtime validation, packaging, and file-dialog checks.

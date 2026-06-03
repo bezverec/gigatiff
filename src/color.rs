@@ -186,15 +186,10 @@ fn write_raw_sampled_row_rgba(
             }
         }
         ColorType::RGB(8) => {
-            for (dst, &src) in out.chunks_exact_mut(4).zip(src_x_byte_offsets) {
-                dst[0..3].copy_from_slice(&src_row[src..src + 3]);
-                dst[3] = 255;
-            }
+            write_raw_sampled_row_rgb8(src_row, src_x_byte_offsets, out);
         }
         ColorType::RGBA(8) => {
-            for (dst, &src) in out.chunks_exact_mut(4).zip(src_x_byte_offsets) {
-                dst.copy_from_slice(&src_row[src..src + 4]);
-            }
+            write_raw_sampled_row_rgba8(src_row, src_x_byte_offsets, out);
         }
         ColorType::Gray(16) => {
             for (dst, &src) in out.chunks_exact_mut(4).zip(src_x_byte_offsets) {
@@ -225,6 +220,123 @@ fn write_raw_sampled_row_rgba(
         other => bail!("unsupported raw strip conversion for {:?}", other),
     }
     Ok(())
+}
+
+fn write_raw_sampled_row_rgb8(src_row: &[u8], src_x_byte_offsets: &[usize], out: &mut [u8]) {
+    let written = write_raw_sampled_row_rgb8_simd(src_row, src_x_byte_offsets, out);
+    for (dst, &src) in out[written * 4..]
+        .chunks_exact_mut(4)
+        .zip(&src_x_byte_offsets[written..])
+    {
+        dst[0..3].copy_from_slice(&src_row[src..src + 3]);
+        dst[3] = 255;
+    }
+}
+
+fn write_raw_sampled_row_rgba8(src_row: &[u8], src_x_byte_offsets: &[usize], out: &mut [u8]) {
+    let written = write_raw_sampled_row_rgba8_simd(src_row, src_x_byte_offsets, out);
+    for (dst, &src) in out[written * 4..]
+        .chunks_exact_mut(4)
+        .zip(&src_x_byte_offsets[written..])
+    {
+        dst.copy_from_slice(&src_row[src..src + 4]);
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn write_raw_sampled_row_rgb8_simd(
+    src_row: &[u8],
+    src_x_byte_offsets: &[usize],
+    out: &mut [u8],
+) -> usize {
+    if src_x_byte_offsets.len() < 4 {
+        return 0;
+    }
+
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::{__m128i, _mm_setr_epi8, _mm_storeu_si128};
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::{__m128i, _mm_setr_epi8, _mm_storeu_si128};
+
+    let chunks = src_x_byte_offsets.len() / 4;
+    for chunk in 0..chunks {
+        let src = &src_x_byte_offsets[chunk * 4..chunk * 4 + 4];
+        let dst = chunk * 16;
+        unsafe {
+            let rgba = _mm_setr_epi8(
+                src_row[src[0]] as i8,
+                src_row[src[0] + 1] as i8,
+                src_row[src[0] + 2] as i8,
+                -1,
+                src_row[src[1]] as i8,
+                src_row[src[1] + 1] as i8,
+                src_row[src[1] + 2] as i8,
+                -1,
+                src_row[src[2]] as i8,
+                src_row[src[2] + 1] as i8,
+                src_row[src[2] + 2] as i8,
+                -1,
+                src_row[src[3]] as i8,
+                src_row[src[3] + 1] as i8,
+                src_row[src[3] + 2] as i8,
+                -1,
+            );
+            _mm_storeu_si128(out.as_mut_ptr().add(dst).cast::<__m128i>(), rgba);
+        }
+    }
+
+    chunks * 4
+}
+
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+fn write_raw_sampled_row_rgb8_simd(
+    _src_row: &[u8],
+    _src_x_byte_offsets: &[usize],
+    _out: &mut [u8],
+) -> usize {
+    0
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn write_raw_sampled_row_rgba8_simd(
+    src_row: &[u8],
+    src_x_byte_offsets: &[usize],
+    out: &mut [u8],
+) -> usize {
+    if src_x_byte_offsets.len() < 4 {
+        return 0;
+    }
+
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::{__m128i, _mm_setr_epi32, _mm_storeu_si128};
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::{__m128i, _mm_setr_epi32, _mm_storeu_si128};
+
+    let chunks = src_x_byte_offsets.len() / 4;
+    for chunk in 0..chunks {
+        let src = &src_x_byte_offsets[chunk * 4..chunk * 4 + 4];
+        let dst = chunk * 16;
+        unsafe {
+            let rgba = _mm_setr_epi32(
+                std::ptr::read_unaligned(src_row.as_ptr().add(src[0]).cast::<i32>()),
+                std::ptr::read_unaligned(src_row.as_ptr().add(src[1]).cast::<i32>()),
+                std::ptr::read_unaligned(src_row.as_ptr().add(src[2]).cast::<i32>()),
+                std::ptr::read_unaligned(src_row.as_ptr().add(src[3]).cast::<i32>()),
+            );
+            _mm_storeu_si128(out.as_mut_ptr().add(dst).cast::<__m128i>(), rgba);
+        }
+    }
+
+    chunks * 4
+}
+
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+fn write_raw_sampled_row_rgba8_simd(
+    _src_row: &[u8],
+    _src_x_byte_offsets: &[usize],
+    _out: &mut [u8],
+) -> usize {
+    0
 }
 
 fn u16_to_u8(bytes: &[u8], little_endian: bool) -> u8 {
@@ -276,6 +388,40 @@ mod tests {
         write_raw_sampled_row_rgba(&src_row, &offsets, ColorType::RGB(8), true, &mut out).unwrap();
 
         assert_eq!(out, [40, 50, 60, 255, 1, 2, 3, 255]);
+    }
+
+    #[test]
+    fn raw_sampled_row_rgb8_handles_simd_chunks_and_tail() {
+        let src_row = [1, 2, 3, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120];
+        let offsets = [12, 0, 6, 3, 9];
+        let mut out = [0u8; 20];
+
+        write_raw_sampled_row_rgba(&src_row, &offsets, ColorType::RGB(8), true, &mut out).unwrap();
+
+        assert_eq!(
+            out,
+            [
+                100, 110, 120, 255, 1, 2, 3, 255, 40, 50, 60, 255, 10, 20, 30, 255, 70, 80, 90, 255
+            ]
+        );
+    }
+
+    #[test]
+    fn raw_sampled_row_rgba8_handles_simd_chunks_and_tail() {
+        let src_row = [
+            1, 2, 3, 4, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160,
+        ];
+        let offsets = [16, 0, 8, 4, 12];
+        let mut out = [0u8; 20];
+
+        write_raw_sampled_row_rgba(&src_row, &offsets, ColorType::RGBA(8), true, &mut out).unwrap();
+
+        assert_eq!(
+            out,
+            [
+                130, 140, 150, 160, 1, 2, 3, 4, 50, 60, 70, 80, 10, 20, 30, 40, 90, 100, 110, 120
+            ]
+        );
     }
 
     #[test]

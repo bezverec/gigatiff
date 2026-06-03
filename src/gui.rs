@@ -10,17 +10,21 @@ use std::thread;
 use anyhow::{Result, anyhow};
 use eframe::egui;
 
-use crate::cache::{ScanlineCache, TileTexture, TileTextureCache};
+use crate::cache::{
+    CachedOverview, OverviewCacheKey, PersistentOverviewCache, ScanlineCache, TileTexture,
+    TileTextureCache,
+};
 use crate::cli::{Backend, PngCompression};
 use crate::render::{
-    PreviewBitmap, PreviewRequest, Rect, RenderCancel, RenderJob, RenderResult, render_preview,
-    save_png,
+    PreviewBitmap, PreviewRequest, Rect, RenderCancel, RenderJob, RenderJobKind, RenderResult,
+    render_preview, save_png,
 };
 use crate::tiff_info::{ImageInfo, load_info};
 
 const GUI_TILE_SIZE: f32 = 384.0;
 const GUI_PREFETCH_TILE_RADIUS: u32 = 1;
 const GUI_RENDER_WORKERS_MAX: usize = 4;
+const GUI_OVERVIEW_MAX_OUTPUT: u32 = 1024;
 const RECENT_FILE_LIMIT: usize = 8;
 
 struct VisibleTile {
@@ -29,11 +33,18 @@ struct VisibleTile {
     uv_rect: egui::Rect,
 }
 
+struct OverviewTexture {
+    key: OverviewCacheKey,
+    texture: egui::TextureHandle,
+    width: u32,
+    height: u32,
+    bytes: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ViewMode {
     Free,
     FitImage,
-    FitWidth,
     ActualSize,
 }
 
@@ -49,6 +60,11 @@ struct ViewerApp {
     render_generation: u64,
     latest_generation: Arc<AtomicU64>,
     tile_cache: TileTextureCache,
+    overview_cache: Option<PersistentOverviewCache>,
+    overview_key: Option<OverviewCacheKey>,
+    loaded_overview: Option<CachedOverview>,
+    overview_texture: Option<OverviewTexture>,
+    pending_overview: Option<OverviewCacheKey>,
     texture_serial: u64,
     status: String,
     source_label: String,
@@ -126,6 +142,7 @@ fn spawn_render_workers(
                         .send(RenderResult {
                             request: job.request,
                             generation: job.generation,
+                            kind: job.kind,
                             result,
                         })
                         .is_err()
@@ -174,6 +191,11 @@ impl ViewerApp {
             render_generation: 0,
             latest_generation,
             tile_cache: TileTextureCache::new(384 * 1024 * 1024),
+            overview_cache: PersistentOverviewCache::new(),
+            overview_key: None,
+            loaded_overview: None,
+            overview_texture: None,
+            pending_overview: None,
             texture_serial: 0,
             status: "Ready".to_string(),
             source_label: String::new(),
@@ -205,6 +227,7 @@ impl ViewerApp {
                 self.view_mode = ViewMode::FitImage;
                 self.status = format!("Opened {}", path.display());
                 self.remember_recent_file(path.clone());
+                self.load_persistent_overview(&path, &info);
                 self.path = Some(path);
                 self.info = Some(info);
                 self.last_request = None;
@@ -225,15 +248,6 @@ impl ViewerApp {
             self.center_y = info.height as f64 / 2.0;
             self.view_width = info.width as f64;
             self.view_mode = ViewMode::FitImage;
-            self.last_request = None;
-        }
-    }
-
-    fn fit_width(&mut self) {
-        if let Some(info) = &self.info {
-            self.center_x = info.width as f64 / 2.0;
-            self.view_width = info.width as f64;
-            self.view_mode = ViewMode::FitWidth;
             self.last_request = None;
         }
     }
@@ -272,12 +286,28 @@ impl ViewerApp {
             if rendered.generation != self.latest_generation.load(Ordering::Relaxed) {
                 continue;
             }
-            self.pending_requests.remove(&rendered.request);
+            match &rendered.kind {
+                RenderJobKind::Tile => {
+                    self.pending_requests.remove(&rendered.request);
+                }
+                RenderJobKind::Overview(key) => {
+                    if self.pending_overview.as_ref() == Some(key) {
+                        self.pending_overview = None;
+                    }
+                }
+            }
 
             match rendered.result {
                 Ok(bitmap) => {
                     let bitmap = Arc::new(bitmap);
-                    self.insert_tile_texture(ctx, rendered.request, &bitmap);
+                    match rendered.kind {
+                        RenderJobKind::Tile => {
+                            self.insert_tile_texture(ctx, rendered.request, &bitmap);
+                        }
+                        RenderJobKind::Overview(key) => {
+                            self.store_and_insert_overview_texture(ctx, key, &bitmap);
+                        }
+                    }
                 }
                 Err(err) => {
                     self.status = format!("Render failed: {err:#}");
@@ -314,11 +344,60 @@ impl ViewerApp {
         ctx.request_repaint();
     }
 
+    fn insert_overview_texture(
+        &mut self,
+        ctx: &egui::Context,
+        key: OverviewCacheKey,
+        overview: &CachedOverview,
+    ) {
+        let color_image = egui::ColorImage::from_rgba_unmultiplied(
+            [overview.width as usize, overview.height as usize],
+            &overview.rgba,
+        );
+        self.texture_serial = self.texture_serial.wrapping_add(1);
+        let texture = ctx.load_texture(
+            format!("giga-overview-{}", self.texture_serial),
+            color_image,
+            egui::TextureOptions::LINEAR,
+        );
+        self.overview_texture = Some(OverviewTexture {
+            key,
+            texture,
+            width: overview.width,
+            height: overview.height,
+            bytes: overview.rgba.len(),
+        });
+        ctx.request_repaint();
+    }
+
+    fn store_and_insert_overview_texture(
+        &mut self,
+        ctx: &egui::Context,
+        key: OverviewCacheKey,
+        bitmap: &PreviewBitmap,
+    ) {
+        if self.overview_key.as_ref() != Some(&key) {
+            return;
+        }
+
+        if let Some(cache) = &self.overview_cache {
+            let _ = cache.store(&key, bitmap.width, bitmap.height, &bitmap.rgba);
+        }
+
+        let overview = CachedOverview {
+            width: bitmap.width,
+            height: bitmap.height,
+            rgba: bitmap.rgba.clone(),
+        };
+        self.insert_overview_texture(ctx, key, &overview);
+    }
+
     fn invalidate_render_jobs(&mut self) {
         self.render_generation = self.render_generation.wrapping_add(1);
         self.latest_generation
             .store(self.render_generation, Ordering::Relaxed);
         self.pending_requests.clear();
+        self.pending_overview = None;
     }
 
     fn queue_render(&mut self, request: PreviewRequest, info: &ImageInfo, status: String) -> bool {
@@ -331,6 +410,7 @@ impl ViewerApp {
             info: info.clone(),
             max_chunk_mb: self.max_chunk_mb,
             generation: self.render_generation,
+            kind: RenderJobKind::Tile,
         });
 
         if send_result.is_ok() {
@@ -340,6 +420,72 @@ impl ViewerApp {
         } else {
             self.status = "Render worker stopped".to_string();
             false
+        }
+    }
+
+    fn load_persistent_overview(&mut self, path: &Path, info: &ImageInfo) {
+        self.overview_key = PersistentOverviewCache::key_for(path, info);
+        self.loaded_overview = None;
+        self.overview_texture = None;
+        self.pending_overview = None;
+
+        let (Some(cache), Some(key)) = (&self.overview_cache, &self.overview_key) else {
+            return;
+        };
+
+        match cache.load(key) {
+            Ok(Some(overview)) => {
+                self.loaded_overview = Some(overview);
+                self.status = format!("Opened {} (overview cache hit)", path.display());
+            }
+            Ok(None) => {}
+            Err(err) => {
+                self.status = format!(
+                    "Opened {} (overview cache skipped: {err:#})",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    fn materialize_loaded_overview(&mut self, ctx: &egui::Context) {
+        let (Some(key), Some(overview)) = (self.overview_key.clone(), self.loaded_overview.take())
+        else {
+            return;
+        };
+        self.insert_overview_texture(ctx, key, &overview);
+    }
+
+    fn queue_overview_render(&mut self, path: &Path, info: &ImageInfo) {
+        if self.overview_texture.is_some() || self.pending_overview.is_some() {
+            return;
+        }
+        let Some(key) = self.overview_key.clone() else {
+            return;
+        };
+
+        let request = PreviewRequest {
+            path: path.to_path_buf(),
+            rect: Rect {
+                x: 0,
+                y: 0,
+                width: info.width,
+                height: info.height,
+            },
+            max_output: GUI_OVERVIEW_MAX_OUTPUT,
+            backend: Backend::Auto,
+        };
+
+        let send_result = self.render_tx.send(RenderJob {
+            request,
+            info: info.clone(),
+            max_chunk_mb: self.max_chunk_mb,
+            generation: self.render_generation,
+            kind: RenderJobKind::Overview(key.clone()),
+        });
+
+        if send_result.is_ok() {
+            self.pending_overview = Some(key);
         }
     }
 
@@ -464,15 +610,14 @@ impl ViewerApp {
     fn mode_label(&self) -> &'static str {
         match self.view_mode {
             ViewMode::Free => "Free",
-            ViewMode::FitImage => "Fit Image",
-            ViewMode::FitWidth => "Fit Width",
+            ViewMode::FitImage => "Fit",
             ViewMode::ActualSize => "Actual Size",
         }
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.horizontal_wrapped(|ui| {
-            if !self.pending_requests.is_empty() {
+            if !self.pending_requests.is_empty() || self.pending_overview.is_some() {
                 ui.add(egui::Spinner::new());
             }
             ui.label(&self.status);
@@ -492,6 +637,7 @@ impl ViewerApp {
 
     fn render_canvas(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         self.drain_render_results(ctx);
+        self.materialize_loaded_overview(ctx);
 
         let available = ui.available_size();
         if available.x < 1.0 || available.y < 1.0 {
@@ -533,7 +679,8 @@ impl ViewerApp {
         }
 
         let source_rect = self.current_rect(&info, canvas.size());
-        let max_output = (canvas.width().max(canvas.height()) * ctx.pixels_per_point())
+        let image_rect = self.image_display_rect(canvas, &info);
+        let max_output = (image_rect.width().max(image_rect.height()) * ctx.pixels_per_point())
             .round()
             .clamp(256.0, 2048.0) as u32;
         let request = PreviewRequest {
@@ -547,11 +694,16 @@ impl ViewerApp {
         }
         self.last_request = Some(request);
 
+        self.draw_overview_texture(&painter, image_rect, source_rect, &info);
+        if self.view_mode == ViewMode::FitImage {
+            self.queue_overview_render(&path, &info);
+        }
+
         let tiles = visible_tile_requests(
             &path,
             &info,
             source_rect,
-            canvas,
+            image_rect,
             ctx.pixels_per_point(),
             Backend::Auto,
         );
@@ -627,7 +779,7 @@ impl ViewerApp {
                     &path,
                     &info,
                     source_rect,
-                    canvas,
+                    image_rect,
                     ctx.pixels_per_point(),
                     Backend::Auto,
                 ) {
@@ -665,14 +817,15 @@ impl ViewerApp {
         }
 
         self.source_label = format!(
-            "tiles {}/{}, tile cache {}{}",
+            "tiles {}/{}, tile cache {}{}{}",
             rendered_tiles,
             total_tiles,
             self.tile_cache.len(),
             latest_tile_label
                 .as_ref()
                 .map(|label| format!(", {label}"))
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            self.overview_label()
         );
         self.loading_label = if rendered_tiles < total_tiles {
             format!(
@@ -684,13 +837,15 @@ impl ViewerApp {
                 "Prefetching nearby tiles, in flight {}",
                 self.pending_requests.len()
             )
+        } else if self.pending_overview.is_some() {
+            "Caching overview".to_string()
         } else {
             "Tiles ready".to_string()
         };
 
         if rendered_tiles > 0 {
             painter.rect_stroke(
-                canvas,
+                image_rect,
                 0.0,
                 egui::Stroke::new(1.0, egui::Color32::from_gray(70)),
                 egui::StrokeKind::Inside,
@@ -699,13 +854,60 @@ impl ViewerApp {
 
         if rendered_tiles == 0 {
             painter.text(
-                canvas.center(),
+                image_rect.center(),
                 egui::Align2::CENTER_CENTER,
                 "Rendering...",
                 egui::FontId::proportional(18.0),
                 egui::Color32::LIGHT_GRAY,
             );
         }
+    }
+
+    fn draw_overview_texture(
+        &self,
+        painter: &egui::Painter,
+        image_rect: egui::Rect,
+        source_rect: Rect,
+        info: &ImageInfo,
+    ) {
+        let Some(overview) = &self.overview_texture else {
+            return;
+        };
+        if self.overview_key.as_ref() != Some(&overview.key) {
+            return;
+        }
+
+        let uv_rect = egui::Rect::from_min_max(
+            egui::pos2(
+                source_rect.x as f32 / info.width as f32,
+                source_rect.y as f32 / info.height as f32,
+            ),
+            egui::pos2(
+                (source_rect.x + source_rect.width) as f32 / info.width as f32,
+                (source_rect.y + source_rect.height) as f32 / info.height as f32,
+            ),
+        );
+        painter.image(
+            overview.texture.id(),
+            image_rect,
+            uv_rect,
+            egui::Color32::from_white_alpha(210),
+        );
+    }
+
+    fn overview_label(&self) -> String {
+        let Some(overview) = &self.overview_texture else {
+            return String::new();
+        };
+        if self.overview_key.as_ref() != Some(&overview.key) {
+            return String::new();
+        }
+        format!(
+            ", overview {} x {} ({:.1} MiB)",
+            overview.width,
+            overview.height,
+            overview.bytes as f64 / (1024.0 * 1024.0)
+        )
     }
 
     fn current_rect(&self, info: &ImageInfo, canvas_size: egui::Vec2) -> Rect {
@@ -721,7 +923,6 @@ impl ViewerApp {
         let aspect = (canvas_size.x.max(1.0) / canvas_size.y.max(1.0)) as f64;
         let mut width = match self.view_mode {
             ViewMode::FitImage => info.width as f64,
-            ViewMode::FitWidth => info.width as f64,
             ViewMode::ActualSize | ViewMode::Free => self.view_width,
         }
         .clamp(1.0, info.width as f64);
@@ -746,6 +947,26 @@ impl ViewerApp {
             height: height.round().max(1.0).min((info.height - y) as f64) as u32,
         }
     }
+
+    fn image_display_rect(&self, canvas: egui::Rect, info: &ImageInfo) -> egui::Rect {
+        if self.view_mode != ViewMode::FitImage {
+            return canvas;
+        }
+
+        fit_rect_in_canvas(canvas, info.width, info.height)
+    }
+}
+
+fn fit_rect_in_canvas(canvas: egui::Rect, width: u32, height: u32) -> egui::Rect {
+    let image_aspect = width.max(1) as f32 / height.max(1) as f32;
+    let canvas_aspect = canvas.width().max(1.0) / canvas.height().max(1.0);
+    let size = if canvas_aspect > image_aspect {
+        egui::vec2(canvas.height() * image_aspect, canvas.height())
+    } else {
+        egui::vec2(canvas.width(), canvas.width() / image_aspect)
+    };
+
+    egui::Rect::from_center_size(canvas.center(), size)
 }
 
 impl eframe::App for ViewerApp {
@@ -767,9 +988,6 @@ impl eframe::App for ViewerApp {
                 }
                 if ui.button("Fit").clicked() {
                     self.fit_view();
-                }
-                if ui.button("Fit Width").clicked() {
-                    self.fit_width();
                 }
                 if ui.button("1:1").clicked() {
                     let canvas_size =
@@ -1182,5 +1400,15 @@ mod tests {
                 .min()
                 .expect("minimum priority")
         );
+    }
+
+    #[test]
+    fn fit_rect_preserves_image_aspect_ratio() {
+        let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 500.0));
+        let fit = fit_rect_in_canvas(canvas, 1000, 1000);
+
+        assert_eq!(fit.width(), 500.0);
+        assert_eq!(fit.height(), 500.0);
+        assert_eq!(fit.center(), canvas.center());
     }
 }
