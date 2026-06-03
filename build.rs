@@ -36,7 +36,11 @@ fn link_windows_libtiff() {
 }
 
 fn link_libtiff_dir(libtiff_dir: &PathBuf) {
-    let lib_dir = libtiff_dir.join("lib");
+    let lib_dir = if libtiff_dir.join("lib").exists() {
+        libtiff_dir.join("lib")
+    } else {
+        libtiff_dir.join("lib64")
+    };
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
     println!("cargo:rustc-link-lib=dylib=tiff");
 }
