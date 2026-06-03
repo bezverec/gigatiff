@@ -103,7 +103,9 @@ target\debug\gigatiff.exe preview mapa2.tif --backend libtiff --x 0 --y 0 --widt
 
 ## libtiff
 
-The build script looks for libtiff here by default:
+The build script links against libtiff through a platform-specific discovery path.
+
+On Windows, it looks for libtiff here by default:
 
 ```text
 C:\temp\libtiff\install
@@ -118,15 +120,49 @@ lib\tiff.lib
 bin\tiff.dll
 ```
 
+The same layout is also accepted from vcpkg, for example:
+
+```powershell
+vcpkg install tiff:x64-windows lcms:x64-windows
+$env:LIBTIFF_DIR="$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows"
+cargo build
+```
+
+On Linux, install libtiff, lcms2, pkg-config, and the GUI build dependencies:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y \
+  libtiff-dev \
+  liblcms2-dev \
+  pkg-config \
+  libgtk-3-dev \
+  libx11-dev \
+  libxi-dev \
+  libxcursor-dev \
+  libxrandr-dev \
+  libxinerama-dev \
+  libxkbcommon-dev \
+  libxkbcommon-x11-dev \
+  libwayland-dev \
+  libgl1-mesa-dev
+cargo build
+```
+
+On macOS, Homebrew provides the required libraries:
+
+```bash
+brew install libtiff little-cms2 pkg-config
+cargo build
+```
+
 ## Platform Notes
 
-The current prototype is developed and verified on Windows with a local libtiff installation under
-`C:\temp\libtiff\install`. The next portability track is Linux and macOS support:
+The project has a GitHub Actions CI workflow for Windows, Linux, and macOS. Windows uses vcpkg in CI,
+while Linux and macOS use `pkg-config` to discover libtiff.
 
-- make `build.rs` discover libtiff through `pkg-config` on Linux and Homebrew/pkg-config on macOS,
-- copy or locate the correct runtime library only when the platform needs it,
-- document per-platform install commands for libtiff and lcms2,
-- add CI builds for Windows, Linux, and macOS once the repository is wired up.
+The GUI has been primarily exercised on Windows so far. Linux/macOS runtime testing is the next
+portability step after CI confirms the project compiles on all three platforms.
 
 ## Current Crates
 
