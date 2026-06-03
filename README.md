@@ -56,8 +56,8 @@ The build script copies `tiff.dll` next to the executable in `target/debug` or `
 GitHub release builds are produced by `.github/workflows/release.yml`. The workflow can be run
 manually to test packaging, and it also runs automatically for tags matching `v*`.
 
-The first release line is intentionally a preview release. It produces three archives from the same
-tag:
+The first release line is intentionally published as a prerelease. It produces three archives from
+the same tag:
 
 - `gigatiff-<version>-windows-x64.zip` with `gigatiff.exe` and vcpkg DLLs,
 - `gigatiff-<version>-linux-x64.zip` with the Linux binary, README, and license,
