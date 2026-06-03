@@ -1,0 +1,124 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  package:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            os: windows-latest
+            package: windows-x64
+          - name: Linux x64
+            os: ubuntu-latest
+            package: linux-x64
+          - name: macOS
+            os: macos-latest
+            package: macos
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libtiff-dev \
+            liblcms2-dev \
+            pkg-config \
+            libgtk-3-dev \
+            libx11-dev \
+            libxi-dev \
+            libxcursor-dev \
+            libxrandr-dev \
+            libxinerama-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libwayland-dev \
+            libgl1-mesa-dev \
+            libasound2-dev \
+            libudev-dev
+
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        run: brew install libtiff little-cms2 pkg-config
+
+      - name: Install Windows dependencies
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          vcpkg install tiff:x64-windows lcms:x64-windows
+          "LIBTIFF_DIR=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package Windows archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}"
+          $packageName = "gigatiff-$version-${{ matrix.package }}"
+          $packageDir = Join-Path "dist" $packageName
+          New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
+          Copy-Item "target\release\gigatiff.exe" $packageDir
+          Copy-Item "README.md", "LICENSE" $packageDir
+          $vcpkgBin = Join-Path $env:VCPKG_INSTALLATION_ROOT "installed\x64-windows\bin"
+          Copy-Item (Join-Path $vcpkgBin "*.dll") $packageDir -ErrorAction SilentlyContinue
+          Compress-Archive -Path "$packageDir\*" -DestinationPath "dist\$packageName.zip" -Force
+
+      - name: Package Unix archive
+        if: runner.os != 'Windows'
+        run: |
+          version="${{ github.ref_name }}"
+          package_name="gigatiff-$version-${{ matrix.package }}"
+          package_dir="dist/$package_name"
+          mkdir -p "$package_dir"
+          cp target/release/gigatiff "$package_dir/"
+          cp README.md LICENSE "$package_dir/"
+          tar -czf "dist/$package_name.tar.gz" -C dist "$package_name"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gigatiff-${{ github.ref_name }}-${{ matrix.package }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+          if-no-files-found: error
+
+      - name: Upload GitHub Release assets
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          prerelease: true
+          generate_release_notes: true
+          files: |
+            dist/*.zip
+            dist/*.tar.gz

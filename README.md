@@ -51,6 +51,22 @@ target\release\gigatiff.exe
 
 The build script copies `tiff.dll` next to the executable in `target/debug` or `target/release`.
 
+## Release Packaging
+
+GitHub release builds are produced by `.github/workflows/release.yml`. The workflow can be run
+manually to test packaging, and it also runs automatically for tags matching `v*`.
+
+The first release line is intentionally a preview release. It produces three archives from the same
+tag:
+
+- `gigatiff-<version>-windows-x64.zip` with `gigatiff.exe` and vcpkg DLLs,
+- `gigatiff-<version>-linux-x64.tar.gz` with the Linux binary, README, and license,
+- `gigatiff-<version>-macos.tar.gz` with the macOS binary, README, and license.
+
+The Windows archive is closest to download-and-run. Linux and macOS archives may still require system
+libraries such as libtiff, lcms2, and GUI runtime dependencies installed through the platform package
+manager.
+
 ## Running the GUI
 
 The release executable can be launched directly:
