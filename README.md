@@ -11,6 +11,17 @@ The default pixel backend is `auto`: it prefers direct raw-strip reads for suita
 stripped TIFFs and falls back to `libtiff` scanlines for broader TIFF support. A pure Rust TIFF path
 is still available as a CLI fallback for supported files.
 
+## Source Layout
+
+The prototype is split into focused Rust modules:
+
+- `src/cli.rs` handles command-line parsing and CLI command dispatch,
+- `src/gui.rs` contains the egui/eframe viewer, tile scheduling, and GUI export flow,
+- `src/render.rs` contains viewport rendering, libtiff/raw-strip backends, PNG writing, and render request types,
+- `src/tiff_info.rs` reads TIFF metadata and handles TIFF decoder setup,
+- `src/color.rs` contains lcms2 transforms and raw sample-to-RGBA conversion,
+- `src/cache.rs` contains LRU caches for GUI tile textures and source-row segments.
+
 ## Build
 
 Debug build:
