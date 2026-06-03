@@ -1,0 +1,8 @@
+/target
+
+# Local sample/benchmark artifacts.
+*.png
+*.tif
+*.tiff
+*.profraw
+*.profdata
