@@ -60,12 +60,14 @@ The first release line is intentionally published as a prerelease. It produces t
 the same tag:
 
 - `gigatiff-<version>-windows-x64.zip` with `gigatiff.exe` and vcpkg DLLs,
-- `gigatiff-<version>-linux-x64.zip` with the Linux binary, README, and license,
-- `gigatiff-<version>-macos.zip` with the macOS binary, README, and license.
+- `gigatiff-<version>-linux-x64.zip` with the Linux binary, a `GigaTIFF.desktop` launcher, README, and license,
+- `gigatiff-<version>-macos.zip` with the macOS binary, a `GigaTIFF.app` bundle, README, and license.
 
-The Windows archive is closest to download-and-run. Linux and macOS archives may still require system
-libraries such as libtiff, lcms2, and GUI runtime dependencies installed through the platform package
-manager.
+The Windows archive is closest to download-and-run. On macOS, launch `GigaTIFF.app` to start the GUI
+without opening Terminal. On Linux, use the included `.desktop` launcher or install it into the
+desktop environment so it runs with `Terminal=false`. Linux and macOS archives may still require
+system libraries such as libtiff, lcms2, and GUI runtime dependencies installed through the platform
+package manager.
 
 ## Running the GUI
 
