@@ -92,7 +92,7 @@ jobs:
           Copy-Item (Join-Path $vcpkgBin "*.dll") $packageDir -ErrorAction SilentlyContinue
           Compress-Archive -Path "$packageDir\*" -DestinationPath "dist\$packageName.zip" -Force
 
-      - name: Package Unix archive
+      - name: Package Unix ZIP archive
         if: runner.os != 'Windows'
         run: |
           version="${{ github.ref_name }}"
@@ -101,24 +101,48 @@ jobs:
           mkdir -p "$package_dir"
           cp target/release/gigatiff "$package_dir/"
           cp README.md LICENSE "$package_dir/"
-          tar -czf "dist/$package_name.tar.gz" -C dist "$package_name"
+          cd dist
+          zip -r "$package_name.zip" "$package_name"
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: gigatiff-${{ github.ref_name }}-${{ matrix.package }}
-          path: |
-            dist/*.zip
-            dist/*.tar.gz
+          path: dist/*.zip
           if-no-files-found: error
 
+  publish:
+    name: Publish draft release
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: gigatiff-${{ github.ref_name }}-*
+          path: dist
+          merge-multiple: true
+
+      - name: Remove existing release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "${{ github.ref_name }}" >/dev/null 2>&1; then
+            gh release view "${{ github.ref_name }}" --json assets --jq '.assets[].name' |
+              while read -r asset; do
+                if [ -n "$asset" ]; then
+                  gh release delete-asset "${{ github.ref_name }}" "$asset" -y
+                fi
+              done
+          fi
+
       - name: Upload GitHub Release assets
-        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           draft: true
           prerelease: true
           generate_release_notes: true
-          files: |
-            dist/*.zip
-            dist/*.tar.gz
+          files: dist/*.zip

@@ -60,8 +60,8 @@ The first release line is intentionally a preview release. It produces three arc
 tag:
 
 - `gigatiff-<version>-windows-x64.zip` with `gigatiff.exe` and vcpkg DLLs,
-- `gigatiff-<version>-linux-x64.tar.gz` with the Linux binary, README, and license,
-- `gigatiff-<version>-macos.tar.gz` with the macOS binary, README, and license.
+- `gigatiff-<version>-linux-x64.zip` with the Linux binary, README, and license,
+- `gigatiff-<version>-macos.zip` with the macOS binary, README, and license.
 
 The Windows archive is closest to download-and-run. Linux and macOS archives may still require system
 libraries such as libtiff, lcms2, and GUI runtime dependencies installed through the platform package
