@@ -2,11 +2,10 @@
 
 A memory-conscious TIFF and BigTIFF viewer prototype written in Rust.
 
-The project has two entry points:
+The project has two application surfaces:
 
-- a desktop GUI with pan/zoom viewport rendering,
-- CLI commands for metadata inspection and PNG preview export.
-- a separate IIIF-compatible image server binary for browser-based viewing.
+- a desktop viewer, exposed as `gigatiff`, with GUI, metadata, and PNG preview/export commands,
+- a separate IIIF-compatible image server, exposed as `gigatiff-server`, for browser-based viewing.
 
 The default pixel backend is `auto`: it prefers direct raw-strip reads for suitable uncompressed
 stripped TIFFs and falls back to `libtiff` scanlines for broader TIFF support. A pure Rust TIFF path
@@ -74,7 +73,12 @@ desktop environment so it runs with `Terminal=false`. Linux and macOS archives m
 system libraries such as libtiff, lcms2, and GUI runtime dependencies installed through the platform
 package manager.
 
-## Running the GUI
+## Desktop Application
+
+The desktop side is the primary standalone viewer. It includes the GUI, the `info` metadata command,
+and the `preview` PNG export command.
+
+### Running the GUI
 
 The release executable can be launched directly:
 
@@ -94,7 +98,55 @@ The older `gui` subcommand is still available:
 target\debug\gigatiff.exe gui
 ```
 
-## Running the Image Server
+The GUI contains a classic `File` menu:
+
+- `File > Browse...` opens a TIFF/BigTIFF through the native file dialog,
+- `File > Export as PNG...` re-renders the current viewport at a higher output size and saves it as PNG,
+- `File > Quit` closes the application.
+
+The top toolbar also includes a path field, `Browse`, aspect-preserving `Fit`, `1:1` actual-size
+zoom, zoom out, and zoom in controls. Additional viewer controls include a zoom percentage readout,
+recent files under the `File` menu, and a bottom status bar with tile loading/cache details.
+
+### CLI Commands
+
+Print metadata without decoding the full image:
+
+```powershell
+target\debug\gigatiff.exe info mapa2.tif
+```
+
+Export a viewport preview through the default `auto` backend:
+
+```powershell
+target\debug\gigatiff.exe preview mapa2.tif --x 0 --y 0 --width 2048 --height 2048 --max-output 512 --out preview.png
+```
+
+Preview export uses fast PNG compression by default. The compression level can be changed when file
+size matters more than export speed:
+
+```powershell
+target\debug\gigatiff.exe preview mapa2.tif --png-compression high --out preview_high.png
+```
+
+Use the pure Rust fallback backend:
+
+```powershell
+target\debug\gigatiff.exe preview mapa2_no_xmp_clean.tif --backend rust --x 0 --y 0 --width 2048 --height 2048 --max-output 512 --out preview_rust.png
+```
+
+Force the `libtiff` scanline backend:
+
+```powershell
+target\debug\gigatiff.exe preview mapa2.tif --backend libtiff --x 0 --y 0 --width 2048 --height 2048 --max-output 512 --out preview_libtiff.png
+```
+
+## Server Application
+
+The server side is intentionally separate from the desktop viewer. It reuses the same TIFF rendering
+pipeline, but exposes it through HTTP, IIIF-style image URLs, and a browser viewer.
+
+### Running the Image Server
 
 `gigatiff-server` is a separate binary so the desktop viewer remains standalone. It exposes TIFF files
 under a root directory through a small IIIF Image API 3.0-compatible surface and includes a minimal
@@ -150,7 +202,7 @@ Server-only builds avoid the desktop GUI dependencies:
 cargo build --release --bin gigatiff-server --no-default-features --features server
 ```
 
-## Docker and Caddy
+### Docker and Caddy
 
 The Docker image builds only the server feature and expects image files mounted at `/data`:
 
@@ -168,7 +220,7 @@ docker compose up --build
 
 Then open `http://localhost:8080/api/images` or a returned `viewer_url`.
 
-## Server Benchmarks
+### Server Benchmarks
 
 The first server benchmark helper measures cold/warm tile requests, cache headers, server-side timing
 headers, output size, and a simple parallel batch:
@@ -192,49 +244,6 @@ the Docker/Caddy stack. `-OutDir` writes both JSON and CSV artefacts:
 
 Use `-ClearCache` when you want to delete files under a local cache directory instead of using the
 HTTP purge endpoint. Add `-Json` when another script should consume the table directly from stdout.
-
-The GUI contains a classic `File` menu:
-
-- `File > Browse...` opens a TIFF/BigTIFF through the native file dialog,
-- `File > Export as PNG...` re-renders the current viewport at a higher output size and saves it as PNG,
-- `File > Quit` closes the application.
-
-The top toolbar also includes a path field, `Browse`, aspect-preserving `Fit`, `1:1` actual-size
-zoom, zoom out, and zoom in controls. Additional viewer controls include a zoom percentage readout,
-recent files under the `File` menu, and a bottom status bar with tile loading/cache details.
-
-## CLI Commands
-
-Print metadata without decoding the full image:
-
-```powershell
-target\debug\gigatiff.exe info mapa2.tif
-```
-
-Export a viewport preview through the default `auto` backend:
-
-```powershell
-target\debug\gigatiff.exe preview mapa2.tif --x 0 --y 0 --width 2048 --height 2048 --max-output 512 --out preview.png
-```
-
-Preview export uses fast PNG compression by default. The compression level can be changed when file
-size matters more than export speed:
-
-```powershell
-target\debug\gigatiff.exe preview mapa2.tif --png-compression high --out preview_high.png
-```
-
-Use the pure Rust fallback backend:
-
-```powershell
-target\debug\gigatiff.exe preview mapa2_no_xmp_clean.tif --backend rust --x 0 --y 0 --width 2048 --height 2048 --max-output 512 --out preview_rust.png
-```
-
-Force the `libtiff` scanline backend:
-
-```powershell
-target\debug\gigatiff.exe preview mapa2.tif --backend libtiff --x 0 --y 0 --width 2048 --height 2048 --max-output 512 --out preview_libtiff.png
-```
 
 ## libtiff
 
@@ -336,6 +345,8 @@ faster path without a color transform.
 
 ## Performance Notes
 
+### Desktop and CLI Rendering
+
 The GUI renders visible image content as source-aligned tile textures. Missing tiles are rendered by
 a small worker pool and inserted incrementally, so panning can reuse tiles that are already in memory
 instead of redrawing the full viewport. Rendered tile textures are kept in a 384 MiB LRU cache.
@@ -382,7 +393,15 @@ PNG export defaults to the `fast` compression mode because preview/export latenc
 important than squeezing out the smallest possible PNG. CLI exports can choose `none`, `fastest`,
 `fast`, `balanced`, or `high` with `--png-compression`.
 
-## Benchmark Summary
+### Server Rendering
+
+The server reuses the shared viewport renderer, then encodes the result as PNG, JPEG, or WebP for
+IIIF image responses. It keeps a persistent encoded response cache on disk, so repeated tile/region
+requests can skip TIFF reads, sampling, color conversion, and image encoding.
+
+## Benchmarks
+
+### Desktop and CLI Benchmarks
 
 These are informal release-build measurements from the local sample files on this machine. The binary
 was built with:
@@ -430,6 +449,8 @@ The GUI tile worker pool is not directly represented by these CLI preview timing
 benefit is interactive: up to four independent tile jobs can be in flight, each with its own
 single-threaded TIFF decode path and source-row cache, while the scheduler prioritizes missing tiles
 closest to the center of the viewport before filling edges and prefetching nearby tiles.
+
+### Server Benchmarks
 
 Server benchmark through Docker Compose and Caddy on `http://127.0.0.1:18082`, requesting a
 512 x 512 source region scaled to 128 px output. The benchmark used
@@ -533,6 +554,8 @@ cargo build --release
 
 ## Capabilities
 
+### Desktop and CLI
+
 - detects classic TIFF vs BigTIFF from the file header,
 - prints dimensions, color type, compression, strip/tile organization, and ICC profile status,
 - reads viewports through `TIFFReadScanline` in the `libtiff` backend,
@@ -546,8 +569,6 @@ cargo build --release
 - caches recently used source-row segments inside each GUI render worker,
 - keeps a 384 MiB LRU cache of rendered GUI tile textures,
 - keeps a persistent full-image overview cache for faster repeat opens,
-- serves TIFF/BigTIFF files through a separate IIIF-compatible `gigatiff-server` binary,
-- provides a minimal OpenSeadragon browser viewer and WebP/PNG/JPEG response encoding,
 - uses a direct no-ICC row conversion fast path for common RGB/Gray/RGBA TIFFs,
 - uses an SSE2 block writer for no-ICC RGB8/RGBA8 sampled rows on x86/x86_64,
 - parallelizes ICC-managed row conversion with `rayon` while keeping file reads single-threaded,
@@ -556,6 +577,16 @@ cargo build --release
 - can decode additional supported strip/tile TIFFs through the Rust `tiff` crate fallback,
 - renders GUI viewport tiles through a small worker pool,
 - exports the current viewport as RGBA PNG.
+
+### Server
+
+- serves TIFF/BigTIFF files through a separate IIIF-compatible `gigatiff-server` binary,
+- provides a minimal OpenSeadragon browser viewer,
+- emits PNG, JPEG, and WebP IIIF image responses,
+- supports persistent encoded response caching with size pruning,
+- exposes cache stats and manual cache purge endpoints,
+- limits concurrent TIFF render jobs to avoid flooding libtiff during fast pan/zoom interaction,
+- includes Docker and Caddy configuration for local browser testing.
 
 ## Sample Files
 
@@ -567,13 +598,20 @@ need to allocate roughly the whole image, which is exactly the memory pressure t
 
 ## Next Steps
 
-Useful next optimization steps:
+Useful next optimization steps for the desktop viewer:
 
-- run tile-size benchmark sweeps for WebP/JPEG/PNG and record the best default tile/output settings,
-- expand IIIF compliance coverage beyond `pct:` regions/sizes and add automated OpenSeadragon smoke tests,
-- evaluate lossy WebP encoding options once the Rust ecosystem path is stable enough for release builds,
-- add Caddy auth/TLS examples for team sharing,
 - add automated GUI interaction benchmarks for pan/zoom/tile warm-cache scenarios,
 - tune tile sizing, worker count, overview-cache size, and eviction policy from those GUI benchmarks,
 - benchmark and tune the explicit SIMD RGB8/RGBA8 path against more sampling ratios,
 - continue Linux and macOS runtime validation, packaging, and file-dialog checks.
+
+Useful next optimization steps for the image server:
+
+- run tile-size benchmark sweeps for WebP/JPEG/PNG and record the best default tile/output settings,
+- expand IIIF compliance coverage beyond `pct:` regions/sizes and add automated OpenSeadragon smoke tests,
+- evaluate lossy WebP encoding options once the Rust ecosystem path is stable enough for release builds.
+
+Useful next deployment steps:
+
+- add Caddy auth/TLS examples for team sharing,
+- consider publishing a Docker image after the server API stabilizes.
