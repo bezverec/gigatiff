@@ -199,7 +199,7 @@ pub async fn run_from_cli() -> Result<()> {
         cache_dir: Arc::new(cache_dir),
         cache_max_bytes: cli.cache_max_mb.saturating_mul(1024 * 1024),
         cache_prune_interval: Duration::from_secs(cli.cache_prune_interval_sec),
-        last_cache_prune: Arc::new(Mutex::new(Instant::now() - Duration::from_secs(3600))),
+        last_cache_prune: Arc::new(Mutex::new(stale_cache_prune_instant())),
         last_cache_prune_report: Arc::new(Mutex::new(CachePruneReport::default())),
         render_permits: Arc::new(Semaphore::new(cli.max_concurrent_renders)),
         info_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -986,6 +986,11 @@ fn parse_format(format: &str) -> Result<ImageFormat> {
     }
 }
 
+fn stale_cache_prune_instant() -> Instant {
+    let now = Instant::now();
+    now.checked_sub(Duration::from_secs(3600)).unwrap_or(now)
+}
+
 fn parse_region(region: &str, info: &ImageInfo) -> Result<Rect> {
     if region == "full" || region == "max" {
         return Ok(Rect {
@@ -1555,7 +1560,7 @@ mod tests {
             cache_dir: Arc::new(cache_dir),
             cache_max_bytes: 4096 * 1024 * 1024,
             cache_prune_interval: Duration::from_secs(60),
-            last_cache_prune: Arc::new(Mutex::new(Instant::now() - Duration::from_secs(3600))),
+            last_cache_prune: Arc::new(Mutex::new(stale_cache_prune_instant())),
             last_cache_prune_report: Arc::new(Mutex::new(CachePruneReport::default())),
             render_permits: Arc::new(Semaphore::new(4)),
             info_cache: Arc::new(Mutex::new(HashMap::new())),
