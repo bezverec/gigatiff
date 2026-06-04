@@ -6,6 +6,7 @@ The project has two entry points:
 
 - a desktop GUI with pan/zoom viewport rendering,
 - CLI commands for metadata inspection and PNG preview export.
+- a separate IIIF-compatible image server binary for browser-based viewing.
 
 The default pixel backend is `auto`: it prefers direct raw-strip reads for suitable uncompressed
 stripped TIFFs and falls back to `libtiff` scanlines for broader TIFF support. A pure Rust TIFF path
@@ -20,7 +21,9 @@ The prototype is split into focused Rust modules:
 - `src/render.rs` contains viewport rendering, libtiff/raw-strip backends, PNG writing, and render request types,
 - `src/tiff_info.rs` reads TIFF metadata and handles TIFF decoder setup,
 - `src/color.rs` contains lcms2 transforms and raw sample-to-RGBA conversion,
-- `src/cache.rs` contains LRU caches for GUI tile textures and source-row segments.
+- `src/cache.rs` contains LRU caches for GUI tile textures and source-row segments,
+- `src/server.rs` contains the experimental IIIF/OpenSeadragon image server,
+- `src/bin/gigatiff-server.rs` is the separate server entry point.
 
 ## Build
 
@@ -46,7 +49,9 @@ Executables:
 
 ```text
 target\debug\gigatiff.exe
+target\debug\gigatiff-server.exe
 target\release\gigatiff.exe
+target\release\gigatiff-server.exe
 ```
 
 The build script copies `tiff.dll` next to the executable in `target/debug` or `target/release`.
@@ -59,9 +64,9 @@ manually to test packaging, and it also runs automatically for tags matching `v*
 The first release line is intentionally published as a prerelease. It produces three archives from
 the same tag:
 
-- `gigatiff-<version>-windows-x64.zip` with `gigatiff.exe` and vcpkg DLLs,
-- `gigatiff-<version>-linux-x64.zip` with the Linux binary, a `GigaTIFF.desktop` launcher, README, and license,
-- `gigatiff-<version>-macos.zip` with the macOS binary, a `GigaTIFF.app` bundle, README, and license.
+- `gigatiff-<version>-windows-x64.zip` with `gigatiff.exe`, `gigatiff-server.exe`, and vcpkg DLLs,
+- `gigatiff-<version>-linux-x64.zip` with the Linux desktop/server binaries, a `GigaTIFF.desktop` launcher, README, and license,
+- `gigatiff-<version>-macos.zip` with the macOS desktop/server binaries, a `GigaTIFF.app` bundle, README, and license.
 
 The Windows archive is closest to download-and-run. On macOS, launch `GigaTIFF.app` to start the GUI
 without opening Terminal. On Linux, use the included `.desktop` launcher or install it into the
@@ -88,6 +93,105 @@ The older `gui` subcommand is still available:
 ```powershell
 target\debug\gigatiff.exe gui
 ```
+
+## Running the Image Server
+
+`gigatiff-server` is a separate binary so the desktop viewer remains standalone. It exposes TIFF files
+under a root directory through a small IIIF Image API 3.0-compatible surface and includes a minimal
+OpenSeadragon viewer.
+
+```powershell
+target\debug\gigatiff-server.exe --root C:\path\to\tiffs --addr 127.0.0.1:8080
+```
+
+The server stores encoded IIIF region/tile responses in a persistent cache. By default this is
+`cache/server`; it can be changed with `--cache-dir`. Cached files are keyed by source path, file
+size, modification time, image dimensions, backend, output format, quality, region, and size. The
+cache is pruned after writes to stay under `--cache-max-mb` (default `4096`). Set `--cache-max-mb 0`
+to disable the persistent response cache. Concurrent TIFF render jobs are limited with
+`--max-concurrent-renders` to avoid flooding libtiff with too many simultaneous requests during fast
+OpenSeadragon pan/zoom interaction.
+
+Useful endpoints:
+
+```text
+GET /api/images
+GET /api/cache
+DELETE /api/cache
+GET /viewer/<image-id>
+GET /iiif/3/<image-id>/info.json
+GET /iiif/3/<image-id>/<region>/<size>/<rotation>/<quality>.<format>
+```
+
+The root page `/` is a small local dashboard with image links, cache size, last prune/purge summary,
+and a manual cache purge action.
+
+IIIF image responses include lightweight diagnostic headers:
+
+```text
+x-gigatiff-cache: hit|miss|disabled
+x-gigatiff-total-ms
+x-gigatiff-cache-read-ms
+x-gigatiff-render-ms
+x-gigatiff-encode-ms
+x-gigatiff-cache-store-ms
+x-gigatiff-cache-prune-ms
+```
+
+The prototype supports `full`/`x,y,w,h`/`pct:x,y,w,h` regions, `max`, `full`, `w,`, `,h`,
+`!w,h`, `w,h`, and `pct:n` sizes, plus the IIIF `^` size prefix for explicit upscaling. Rotation is
+currently limited to `0`; qualities are `default`/`color`; output formats are `png`, `jpg`, and
+`webp`. WebP is currently encoded losslessly by the Rust `image` crate; JPEG uses `--quality` and PNG
+uses fast compression.
+
+Server-only builds avoid the desktop GUI dependencies:
+
+```powershell
+cargo build --release --bin gigatiff-server --no-default-features --features server
+```
+
+## Docker and Caddy
+
+The Docker image builds only the server feature and expects image files mounted at `/data`:
+
+```bash
+docker build -t gigatiff-server .
+docker run --rm -p 8080:8080 -v "$PWD/images:/data:ro" -v "$PWD/cache:/cache" gigatiff-server
+```
+
+The included `docker-compose.yml` runs `gigatiff-server` behind Caddy:
+
+```bash
+mkdir -p images
+docker compose up --build
+```
+
+Then open `http://localhost:8080/api/images` or a returned `viewer_url`.
+
+## Server Benchmarks
+
+The first server benchmark helper measures cold/warm tile requests, cache headers, server-side timing
+headers, output size, and a simple parallel batch:
+
+```powershell
+.\scripts\bench-server.ps1 -BaseUrl http://127.0.0.1:18082 -Iterations 5 -Parallel 8
+```
+
+Use `-RegionSizes` and `-OutputSizes` to compare multiple IIIF request shapes in one run.
+`-PurgeServerCache` clears the server through `DELETE /api/cache`, which is useful when benchmarking
+the Docker/Caddy stack. `-OutDir` writes both JSON and CSV artefacts:
+
+```powershell
+.\scripts\bench-server.ps1 -BaseUrl http://127.0.0.1:18082 `
+    -Formats webp,jpg,png `
+    -RegionSizes 256,512,1024 `
+    -OutputSizes 128,256,512 `
+    -PurgeServerCache `
+    -OutDir target/server-benchmarks
+```
+
+Use `-ClearCache` when you want to delete files under a local cache directory instead of using the
+HTTP purge endpoint. Add `-Json` when another script should consume the table directly from stdout.
 
 The GUI contains a classic `File` menu:
 
@@ -201,14 +305,25 @@ Direct dependencies are pinned to current crates.io releases:
 
 ```text
 anyhow  = 1.0.102
+axum    = 0.8.9
 clap    = 4.6.1
 eframe  = 0.34.3
+image   = 0.25.10
 lcms2   = 6.1.1
+percent-encoding = 2.3.2
 png     = 0.18.1
 rayon   = 1.12.0
 rfd     = 0.17.2
+serde   = 1.0.228
+serde_json = 1.0.150
 tiff    = 0.11.3
+tokio   = 1.52.3
+tower-http = 0.6.11
 ```
+
+Desktop-specific dependencies are behind the `desktop` feature, and server-specific HTTP/encoding
+dependencies are behind the `server` feature. The default build enables both so CI checks both
+binaries.
 
 ## Color Management
 
@@ -316,6 +431,52 @@ benefit is interactive: up to four independent tile jobs can be in flight, each 
 single-threaded TIFF decode path and source-row cache, while the scheduler prioritizes missing tiles
 closest to the center of the viewport before filling edges and prefetching nearby tiles.
 
+Server benchmark through Docker Compose and Caddy on `http://127.0.0.1:18082`, requesting a
+512 x 512 source region scaled to 128 px output. The benchmark used
+`.\scripts\bench-server.ps1 -Iterations 5 -Parallel 8 -ClearCache` for the cold-cache pass and the
+same command without `-ClearCache` for the warm-cache pass.
+
+For tile-size sweeps, use `-RegionSizes 256,512,1024` and `-OutputSizes 128,256,512`. The result
+table includes `RegionSize` and `OutputSize` columns so rendering cost, encoding cost, response size,
+and cache behavior can be compared across IIIF request shapes. The helper also records server timing
+averages for render, encode, cache read, cache store, and cache prune phases when those headers are
+present.
+
+Small WebP tile-size smoke run after the `pct:` IIIF update
+(`-ImageIds mapa2_no_xmp_clean.tif -Formats webp -OutputSizes 128,256 -Iterations 2 -Parallel 2 -ClearCache`):
+
+```text
+output px  cold ms  warm avg ms  warm server ms  bytes   parallel wall ms
+128          223.3         15.4             2.4   27836              72.9
+256           52.8         18.1             3.2  105518              84.3
+```
+
+```text
+Cold-cache single tile requests:
+
+image                     format  cold ms  warm avg ms  bytes
+mapa2_no_xmp_clean.tif    webp      293.7         15.1   27836
+mapa2_no_xmp_clean.tif    jpg        64.8         15.1    3671
+mapa2_no_xmp_clean.tif    png        60.6         16.0   34790
+mapa2.tif                 webp       50.7         11.3   27750
+mapa2.tif                 jpg        50.0          9.7    3437
+mapa2.tif                 png        51.7         10.5   33930
+
+Parallel batch of 8 distinct tile requests:
+
+image                     format  cold wall ms  warm wall ms
+mapa2_no_xmp_clean.tif    webp          273.3         149.1
+mapa2_no_xmp_clean.tif    jpg           254.7         100.1
+mapa2_no_xmp_clean.tif    png           184.5         129.8
+mapa2.tif                 webp          190.5          98.2
+mapa2.tif                 jpg           184.7          91.8
+mapa2.tif                 png           212.6         152.3
+```
+
+The server emits `x-gigatiff-cache: miss|hit|disabled`. Warm-cache reads are served from the
+persistent encoded response cache, so they avoid TIFF reads, sampling, color conversion, and image
+encoding for repeated IIIF requests.
+
 PGO release build after running the representative preview workloads below:
 
 ```text
@@ -385,6 +546,8 @@ cargo build --release
 - caches recently used source-row segments inside each GUI render worker,
 - keeps a 384 MiB LRU cache of rendered GUI tile textures,
 - keeps a persistent full-image overview cache for faster repeat opens,
+- serves TIFF/BigTIFF files through a separate IIIF-compatible `gigatiff-server` binary,
+- provides a minimal OpenSeadragon browser viewer and WebP/PNG/JPEG response encoding,
 - uses a direct no-ICC row conversion fast path for common RGB/Gray/RGBA TIFFs,
 - uses an SSE2 block writer for no-ICC RGB8/RGBA8 sampled rows on x86/x86_64,
 - parallelizes ICC-managed row conversion with `rayon` while keeping file reads single-threaded,
@@ -406,6 +569,10 @@ need to allocate roughly the whole image, which is exactly the memory pressure t
 
 Useful next optimization steps:
 
+- run tile-size benchmark sweeps for WebP/JPEG/PNG and record the best default tile/output settings,
+- expand IIIF compliance coverage beyond `pct:` regions/sizes and add automated OpenSeadragon smoke tests,
+- evaluate lossy WebP encoding options once the Rust ecosystem path is stable enough for release builds,
+- add Caddy auth/TLS examples for team sharing,
 - add automated GUI interaction benchmarks for pan/zoom/tile warm-cache scenarios,
 - tune tile sizing, worker count, overview-cache size, and eviction policy from those GUI benchmarks,
 - benchmark and tune the explicit SIMD RGB8/RGBA8 path against more sampling ratios,
