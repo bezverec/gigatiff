@@ -14,7 +14,7 @@ use crate::cache::{
     CachedOverview, OverviewCacheKey, PersistentOverviewCache, ScanlineCache, TileTexture,
     TileTextureCache,
 };
-use crate::cli::{Backend, PngCompression};
+use crate::options::{Backend, PngCompression};
 use crate::render::{
     PreviewBitmap, PreviewRequest, Rect, RenderCancel, RenderJob, RenderJobKind, RenderResult,
     render_preview, save_png,

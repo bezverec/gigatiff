@@ -1,0 +1,32 @@
+services:
+  gigatiff-server:
+    build: .
+    command:
+      - --root
+      - /data
+      - --cache-dir
+      - /cache
+      - --cache-max-mb
+      - "4096"
+      - --max-concurrent-renders
+      - "4"
+      - --addr
+      - 0.0.0.0:8080
+    volumes:
+      - ./images:/data:ro
+      - ./cache:/cache
+
+  caddy:
+    image: caddy:2
+    depends_on:
+      - gigatiff-server
+    ports:
+      - "127.0.0.1:18082:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:

@@ -1,4 +1,5 @@
 /target
+/cache
 
 # Local sample/benchmark artifacts.
 *.png

@@ -2,9 +2,10 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Result, bail};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 
 use crate::gui::run_gui;
+use crate::options::{Backend, PngCompression};
 use crate::render::{clamp_rect, ms, render_preview, save_png};
 use crate::tiff_info::{load_info, print_info};
 
@@ -64,35 +65,7 @@ enum Command {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ValueEnum)]
-pub(crate) enum Backend {
-    Auto,
-    Libtiff,
-    Rust,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub(crate) enum PngCompression {
-    None,
-    Fastest,
-    Fast,
-    Balanced,
-    High,
-}
-
-impl PngCompression {
-    pub(crate) fn to_png(self) -> png::Compression {
-        match self {
-            Self::None => png::Compression::NoCompression,
-            Self::Fastest => png::Compression::Fastest,
-            Self::Fast => png::Compression::Fast,
-            Self::Balanced => png::Compression::Balanced,
-            Self::High => png::Compression::High,
-        }
-    }
-}
-
-pub(crate) fn run() -> Result<()> {
+pub fn run() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result};
+#[cfg(feature = "desktop")]
 use eframe::egui;
 
 use crate::render::{PreviewRequest, RenderStats};
@@ -15,6 +16,7 @@ const OVERVIEW_MAGIC: &[u8; 8] = b"GTOV0001";
 const OVERVIEW_CACHE_LIMIT: u64 = 256 * 1024 * 1024;
 const OVERVIEW_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
+#[cfg(feature = "desktop")]
 pub(crate) struct TileTexture {
     pub(crate) texture: egui::TextureHandle,
     pub(crate) width: u32,
@@ -24,6 +26,7 @@ pub(crate) struct TileTexture {
     pub(crate) bytes: usize,
 }
 
+#[cfg(feature = "desktop")]
 pub(crate) struct TileTextureCache {
     pub(crate) entries: VecDeque<(PreviewRequest, Arc<TileTexture>)>,
     pub(crate) byte_limit: usize,
@@ -61,6 +64,7 @@ pub(crate) struct PersistentOverviewCache {
     byte_limit: u64,
 }
 
+#[cfg(feature = "desktop")]
 impl TileTextureCache {
     pub(crate) fn new(byte_limit: usize) -> Self {
         Self {

@@ -1,0 +1,11 @@
+.git
+target
+dist
+*.tif
+*.tiff
+*.png
+*.jpg
+*.jpeg
+*.webp
+images
+cache

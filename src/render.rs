@@ -14,8 +14,8 @@ use tiff::ColorType;
 use tiff::decoder::{ChunkType, Decoder, DecodingResult};
 
 use crate::cache::{OverviewCacheKey, ScanlineCache, ScanlineKey};
-use crate::cli::{Backend, PngCompression};
 use crate::color::{ColorTransform, bits_for_color, samples_for_color, write_sampled_row_rgba};
+use crate::options::{Backend, PngCompression};
 use crate::tiff_info::{ImageInfo, can_read_raw_strips, open_decoder};
 
 const PARALLEL_ROW_BATCH: usize = 32;
