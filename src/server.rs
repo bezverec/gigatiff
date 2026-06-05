@@ -470,7 +470,7 @@ async fn iiif_info(state: Arc<AppState>, headers: HeaderMap, id: String) -> Resp
             "rotationBy90s",
             "sizeUpscaling"
         ],
-        "qualities": ["default", "color", "gray", "bitonal"],
+        "extraQualities": ["color", "gray", "bitonal"],
         "sizes": preferred_sizes(info.width, info.height, state.max_output_pixels),
         "tiles": [{
             "width": state.tile_size,

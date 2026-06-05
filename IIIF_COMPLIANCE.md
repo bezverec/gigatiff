@@ -16,7 +16,7 @@ The server advertises only optional features it implements.
 
 | Area | Feature | Status | Notes |
 | --- | --- | --- | --- |
-| Information | `info.json` | Supported | Returns `ImageService3`, JSON-LD content type, dimensions, preferred sizes, tiles, `maxArea`, formats, qualities, and extra features. |
+| Information | `info.json` | Supported | Returns `ImageService3`, JSON-LD content type, dimensions, preferred sizes, tiles, `maxArea`, preferred/extra formats, extra qualities, and extra features. |
 | Information | `profile: level2` | Supported | Advertised when the server is built with the current server implementation. |
 | Information | `tiles` | Supported | Advertises square tiles with powers-of-two scale factors. |
 | Information | `sizes` | Supported | Advertises powers-of-two full-image variants that stay within `maxArea`. |
@@ -36,9 +36,9 @@ The server advertises only optional features it implements.
 | Rotation | arbitrary values | Not advertised | Requests such as `45` return `400`. |
 | Rotation | mirroring `!n` | Supported | Mirroring is applied before rotation, as specified. |
 | Quality | `default` | Supported | Same output as `color`. |
-| Quality | `color` | Supported | Color response. |
-| Quality | `gray` | Supported | Converts RGB channels to luminance while preserving alpha. |
-| Quality | `bitonal` | Supported | Applies a simple luminance threshold. |
+| Quality | `color` | Supported | Color response; advertised in `extraQualities`. |
+| Quality | `gray` | Supported | Converts RGB channels to luminance while preserving alpha; advertised in `extraQualities`. |
+| Quality | `bitonal` | Supported | Applies a simple luminance threshold; advertised in `extraQualities`. |
 | Format | `jpg` / `jpeg` | Supported | JPEG output; canonical links use `jpg`. |
 | Format | `png` | Supported | PNG output. |
 | Format | `webp` | Supported | WebP output; optional and advertised in `extraFormats`. |
