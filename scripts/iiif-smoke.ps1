@@ -95,6 +95,34 @@ function Add-Result {
     }
 }
 
+function Invoke-ImageCase {
+    param(
+        [string]$Name,
+        [string]$Uri,
+        [string]$ExpectedType
+    )
+
+    $out = Join-Path ([IO.Path]::GetTempPath()) ("gigatiff-iiif-smoke-" + [Guid]::NewGuid().ToString("N"))
+    try {
+        $response = Invoke-WebRequest -UseBasicParsing -Uri $Uri -OutFile $out -PassThru
+        $bytes = (Get-Item -LiteralPath $out).Length
+        $contentType = Get-Header $response.Headers "Content-Type"
+        $link = Get-Header $response.Headers "Link"
+
+        Assert-True ([int]$response.StatusCode -eq 200) "$Name should return 200"
+        Assert-True ($bytes -gt 0) "$Name should return bytes"
+        Assert-True ($contentType -like "$ExpectedType*") "$Name should return $ExpectedType"
+        Assert-True ((Get-Header $response.Headers "Cache-Control") -like "*max-age=86400*") "$Name should include long cache-control"
+        Assert-True ($link -like "*level2.json*rel=`"profile`"*") "$Name should include profile Link"
+        Assert-True ($link -like "*rel=`"canonical`"*") "$Name should include canonical Link"
+        return $bytes
+    } finally {
+        if (Test-Path -LiteralPath $out) {
+            Remove-Item -LiteralPath $out -Force
+        }
+    }
+}
+
 $encodedId = Escape-ImageId $ImageId
 $RegionSize = [Math]::Max(1, $RegionSize)
 $OutputSize = [Math]::Max(1, $OutputSize)
@@ -117,6 +145,7 @@ try {
     $qualities = Get-JsonProperty $info "qualities"
     $extraFeatures = Get-JsonProperty $info "extraFeatures"
     $sizes = @(Get-JsonProperty $info "sizes")
+    $tiles = @(Get-JsonProperty $info "tiles")
 
     Assert-True ($profile -eq "level2") "info.json profile should be level2"
     Assert-True ($infoContentType -like "*application/ld+json*") "info.json should use JSON-LD media type"
@@ -136,6 +165,8 @@ try {
         Assert-True (([int64]$size.width * [int64]$size.height) -le [int64]$info.maxArea) "info.json sizes should respect maxArea"
     }
     Assert-True (@($sizes | Where-Object { [int]$_.width -eq [int]$info.width -and [int]$_.height -eq [int]$info.height }).Count -gt 0) "info.json sizes should include full dimensions when within maxArea"
+    Assert-True ($tiles.Count -gt 0) "info.json should advertise tiles"
+    Assert-True (@($tiles[0].scaleFactors).Count -gt 0) "info.json tiles should advertise scale factors"
     $results.Add((Add-Result "info.json" "pass" "profile=$profile")) | Out-Null
 
     $redirect = Invoke-NoRedirect "$BaseUrl/iiif/3/$encodedId"
@@ -162,26 +193,26 @@ try {
 
     foreach ($case in $cases) {
         $url = "$BaseUrl/iiif/3/$encodedId/$($case.Path)"
-        $out = Join-Path ([IO.Path]::GetTempPath()) ("gigatiff-iiif-smoke-" + [Guid]::NewGuid().ToString("N"))
-        try {
-            $response = Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $out -PassThru
-            $bytes = (Get-Item -LiteralPath $out).Length
-            $contentType = Get-Header $response.Headers "Content-Type"
-            $link = Get-Header $response.Headers "Link"
-
-            Assert-True ([int]$response.StatusCode -eq 200) "$($case.Name) should return 200"
-            Assert-True ($bytes -gt 0) "$($case.Name) should return bytes"
-            Assert-True ($contentType -like "$($case.Type)*") "$($case.Name) should return $($case.Type)"
-            Assert-True ((Get-Header $response.Headers "Cache-Control") -like "*max-age=86400*") "$($case.Name) should include long cache-control"
-            Assert-True ($link -like "*level2.json*rel=`"profile`"*") "$($case.Name) should include profile Link"
-            Assert-True ($link -like "*rel=`"canonical`"*") "$($case.Name) should include canonical Link"
-            $results.Add((Add-Result $case.Name "pass" "$bytes bytes")) | Out-Null
-        } finally {
-            if (Test-Path -LiteralPath $out) {
-                Remove-Item -LiteralPath $out -Force
-            }
-        }
+        $bytes = Invoke-ImageCase $case.Name $url $case.Type
+        $results.Add((Add-Result $case.Name "pass" "$bytes bytes")) | Out-Null
     }
+
+    $preferredSize = $sizes[-1]
+    $preferredSizePath = "full/$([int]$preferredSize.width),$([int]$preferredSize.height)/0/default.jpg"
+    $preferredSizeBytes = Invoke-ImageCase "advertised size jpg" "$BaseUrl/iiif/3/$encodedId/$preferredSizePath" "image/jpeg"
+    $results.Add((Add-Result "advertised size jpg" "pass" "$([int]$preferredSize.width)x$([int]$preferredSize.height), $preferredSizeBytes bytes")) | Out-Null
+
+    $tile = $tiles[0]
+    $scaleFactor = [int]@($tile.scaleFactors)[0]
+    $tileWidth = [int]$tile.width
+    $tileHeight = if ($null -ne $tile.height) { [int]$tile.height } else { $tileWidth }
+    $tileRegionWidth = [Math]::Min([int]$info.width, $tileWidth * $scaleFactor)
+    $tileRegionHeight = [Math]::Min([int]$info.height, $tileHeight * $scaleFactor)
+    $tileOutputWidth = [Math]::Max(1, [int][Math]::Ceiling($tileRegionWidth / [double]$scaleFactor))
+    $tileOutputHeight = [Math]::Max(1, [int][Math]::Ceiling($tileRegionHeight / [double]$scaleFactor))
+    $tilePath = "0,0,$tileRegionWidth,$tileRegionHeight/$tileOutputWidth,$tileOutputHeight/0/default.jpg"
+    $tileBytes = Invoke-ImageCase "advertised tile jpg" "$BaseUrl/iiif/3/$encodedId/$tilePath" "image/jpeg"
+    $results.Add((Add-Result "advertised tile jpg" "pass" "scale=$scaleFactor, $tileOutputWidth`x$tileOutputHeight, $tileBytes bytes")) | Out-Null
 
     $canonicalA = "$BaseUrl/iiif/3/$encodedId/0,0,$RegionSize,$RegionSize/$OutputSize,/0/default.jpg"
     $canonicalB = "$BaseUrl/iiif/3/$encodedId/0,0,$RegionSize,$RegionSize/$OutputSize,$OutputSize/0/default.jpeg"
