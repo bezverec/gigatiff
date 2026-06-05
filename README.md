@@ -227,8 +227,8 @@ Then open `http://127.0.0.1:18082/api/images` or a returned `viewer_url`.
 ### IIIF Smoke Test
 
 The IIIF smoke helper checks the advertised profile, JSON-LD media type, base URI redirect, CORS,
-preferred `sizes`, profile/canonical `Link` headers, representative level 2 image requests, selected
-negative requests, and canonical cache-key reuse:
+preferred `sizes`, advertised tile geometry, profile/canonical `Link` headers, representative level 2
+image requests, selected negative requests, and canonical cache-key reuse:
 
 ```powershell
 .\scripts\iiif-smoke.ps1 -BaseUrl http://127.0.0.1:18082 -ImageId mapa2.tif

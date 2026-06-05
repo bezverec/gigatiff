@@ -59,6 +59,6 @@ docker compose up -d --build
 .\scripts\iiif-smoke.ps1 -BaseUrl http://127.0.0.1:18082 -ImageId mapa2.tif
 ```
 
-The smoke test checks the advertised profile, HTTP features, representative Level 2 image requests, selected negative requests, and canonical cache-key reuse for equivalent requests.
+The smoke test checks the advertised profile, HTTP features, preferred-size requests, advertised tile geometry, representative Level 2 image requests, selected negative requests, and canonical cache-key reuse for equivalent requests.
 
 The GitHub Actions `IIIF server smoke` job generates a tiny TIFF fixture, starts the Docker Compose stack, and runs this smoke test on every push and pull request.
