@@ -142,7 +142,7 @@ try {
     $infoContentType = Get-Header $infoResponse.Headers "Content-Type"
 
     $profile = Get-JsonProperty $info "profile"
-    $qualities = Get-JsonProperty $info "qualities"
+    $extraQualities = Get-JsonProperty $info "extraQualities"
     $extraFeatures = Get-JsonProperty $info "extraFeatures"
     $sizes = @(Get-JsonProperty $info "sizes")
     $tiles = @(Get-JsonProperty $info "tiles")
@@ -150,8 +150,9 @@ try {
     Assert-True ($profile -eq "level2") "info.json profile should be level2"
     Assert-True ($infoContentType -like "*application/ld+json*") "info.json should use JSON-LD media type"
     Assert-True ($infoLink -like "*level2.json*rel=`"profile`"*") "info.json should include profile Link header"
-    foreach ($quality in @("default", "color", "gray", "bitonal")) {
-        Assert-True ($qualities -contains $quality) "info.json should advertise quality $quality"
+    Assert-True ($null -eq (Get-JsonProperty $info "qualities")) "info.json should not use the IIIF 2 qualities property"
+    foreach ($quality in @("color", "gray", "bitonal")) {
+        Assert-True ($extraQualities -contains $quality) "info.json should advertise extra quality $quality"
     }
     foreach ($feature in @("baseUriRedirect", "canonicalLinkHeader", "cors", "jsonldMediaType", "mirroring", "profileLinkHeader", "rotationBy90s", "sizeUpscaling")) {
         Assert-True ($extraFeatures -contains $feature) "info.json should advertise extra feature $feature"
