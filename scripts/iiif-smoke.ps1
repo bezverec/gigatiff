@@ -152,7 +152,7 @@ try {
 
     foreach ($case in $cases) {
         $url = "$BaseUrl/iiif/3/$encodedId/$($case.Path)"
-        $out = Join-Path $env:TEMP ("gigatiff-iiif-smoke-" + [Guid]::NewGuid().ToString("N"))
+        $out = Join-Path ([IO.Path]::GetTempPath()) ("gigatiff-iiif-smoke-" + [Guid]::NewGuid().ToString("N"))
         try {
             $response = Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $out -PassThru
             $bytes = (Get-Item -LiteralPath $out).Length
