@@ -116,6 +116,7 @@ try {
     $profile = Get-JsonProperty $info "profile"
     $qualities = Get-JsonProperty $info "qualities"
     $extraFeatures = Get-JsonProperty $info "extraFeatures"
+    $sizes = @(Get-JsonProperty $info "sizes")
 
     Assert-True ($profile -eq "level2") "info.json profile should be level2"
     Assert-True ($infoContentType -like "*application/ld+json*") "info.json should use JSON-LD media type"
@@ -126,6 +127,15 @@ try {
     foreach ($feature in @("baseUriRedirect", "canonicalLinkHeader", "cors", "jsonldMediaType", "mirroring", "profileLinkHeader", "rotationBy90s", "sizeUpscaling")) {
         Assert-True ($extraFeatures -contains $feature) "info.json should advertise extra feature $feature"
     }
+    Assert-True ($sizes.Count -gt 0) "info.json should advertise preferred sizes"
+    foreach ($size in $sizes) {
+        Assert-True ([int]$size.width -gt 0) "info.json sizes should have positive widths"
+        Assert-True ([int]$size.height -gt 0) "info.json sizes should have positive heights"
+        Assert-True ([int]$size.width -le [int]$info.width) "info.json sizes should not exceed full width"
+        Assert-True ([int]$size.height -le [int]$info.height) "info.json sizes should not exceed full height"
+        Assert-True (([int64]$size.width * [int64]$size.height) -le [int64]$info.maxArea) "info.json sizes should respect maxArea"
+    }
+    Assert-True (@($sizes | Where-Object { [int]$_.width -eq [int]$info.width -and [int]$_.height -eq [int]$info.height }).Count -gt 0) "info.json sizes should include full dimensions when within maxArea"
     $results.Add((Add-Result "info.json" "pass" "profile=$profile")) | Out-Null
 
     $redirect = Invoke-NoRedirect "$BaseUrl/iiif/3/$encodedId"

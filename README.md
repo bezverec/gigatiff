@@ -195,8 +195,9 @@ The server targets IIIF Image API 3.0 `level2`. It supports `full`/`square`/`x,y
 `pct:x,y,w,h` regions; `max`, `full`, `w,`, `,h`, `!w,h`, `w,h`, and `pct:n` sizes; and the IIIF
 `^` size prefix for explicit upscaling. Rotation supports `0`, `90`, `180`, and `270` degrees plus
 IIIF mirroring with `!`. Qualities are `default`, `color`, `gray`, and `bitonal`; output formats are
-`png`, `jpg`/`jpeg`, and `webp`. The server emits IIIF `Link` headers for the level 2 profile and
-canonical image URI. WebP is currently encoded losslessly by the Rust `image` crate; JPEG uses
+`png`, `jpg`/`jpeg`, and `webp`. `info.json` advertises powers-of-two preferred `sizes` for full-image
+requests that stay within `maxArea`. The server emits IIIF `Link` headers for the level 2 profile
+and canonical image URI. WebP is currently encoded losslessly by the Rust `image` crate; JPEG uses
 `--quality` and PNG uses fast compression. See `IIIF_COMPLIANCE.md` for the detailed feature matrix.
 
 Server-only builds avoid the desktop GUI dependencies:
@@ -226,8 +227,8 @@ Then open `http://127.0.0.1:18082/api/images` or a returned `viewer_url`.
 ### IIIF Smoke Test
 
 The IIIF smoke helper checks the advertised profile, JSON-LD media type, base URI redirect, CORS,
-profile/canonical `Link` headers, representative level 2 image requests, selected negative requests,
-and canonical cache-key reuse:
+preferred `sizes`, profile/canonical `Link` headers, representative level 2 image requests, selected
+negative requests, and canonical cache-key reuse:
 
 ```powershell
 .\scripts\iiif-smoke.ps1 -BaseUrl http://127.0.0.1:18082 -ImageId mapa2.tif
@@ -607,7 +608,7 @@ cargo build --release
 - serves TIFF/BigTIFF files through a separate IIIF-compatible `gigatiff-server` binary,
 - provides a minimal OpenSeadragon browser viewer,
 - targets IIIF Image API 3.0 `level2` with region, size, rotation, mirroring, color/gray/bitonal
-  quality, profile-link, canonical-link, and base-URI redirect coverage,
+  quality, preferred-sizes, profile-link, canonical-link, and base-URI redirect coverage,
 - emits PNG, JPEG, and WebP IIIF image responses,
 - supports persistent encoded response caching with size pruning and canonical IIIF cache keys,
 - exposes cache stats and manual cache purge endpoints,
@@ -636,7 +637,6 @@ Useful next optimization steps for the image server:
 
 - run tile-size benchmark sweeps for WebP/JPEG/PNG and record the best default tile/output settings,
 - add automated OpenSeadragon browser smoke tests on top of the current HTTP-level IIIF smoke test,
-- consider advertising a `sizes` array in `info.json` for common downsampled dimensions,
 - evaluate lossy WebP encoding options once the Rust ecosystem path is stable enough for release builds.
 
 Useful next deployment steps:
