@@ -158,11 +158,11 @@ target\debug\gigatiff-server.exe --root C:\path\to\tiffs --addr 127.0.0.1:8080
 
 The server stores encoded IIIF region/tile responses in a persistent cache. By default this is
 `cache/server`; it can be changed with `--cache-dir`. Cached files are keyed by source path, file
-size, modification time, image dimensions, backend, output format, quality, region, and size. The
-cache is pruned after writes to stay under `--cache-max-mb` (default `4096`). Set `--cache-max-mb 0`
-to disable the persistent response cache. Concurrent TIFF render jobs are limited with
-`--max-concurrent-renders` to avoid flooding libtiff with too many simultaneous requests during fast
-OpenSeadragon pan/zoom interaction.
+size, modification time, image dimensions, backend, encoder settings, and the canonical IIIF image
+URI, so equivalent request spellings reuse the same cache entry. The cache is pruned after writes to
+stay under `--cache-max-mb` (default `4096`). Set `--cache-max-mb 0` to disable the persistent
+response cache. Concurrent TIFF render jobs are limited with `--max-concurrent-renders` to avoid
+flooding libtiff with too many simultaneous requests during fast OpenSeadragon pan/zoom interaction.
 
 Useful endpoints:
 
@@ -171,6 +171,7 @@ GET /api/images
 GET /api/cache
 DELETE /api/cache
 GET /viewer/<image-id>
+GET /iiif/3/<image-id>
 GET /iiif/3/<image-id>/info.json
 GET /iiif/3/<image-id>/<region>/<size>/<rotation>/<quality>.<format>
 ```
@@ -190,11 +191,13 @@ x-gigatiff-cache-store-ms
 x-gigatiff-cache-prune-ms
 ```
 
-The prototype supports `full`/`x,y,w,h`/`pct:x,y,w,h` regions, `max`, `full`, `w,`, `,h`,
-`!w,h`, `w,h`, and `pct:n` sizes, plus the IIIF `^` size prefix for explicit upscaling. Rotation is
-currently limited to `0`; qualities are `default`/`color`; output formats are `png`, `jpg`, and
-`webp`. WebP is currently encoded losslessly by the Rust `image` crate; JPEG uses `--quality` and PNG
-uses fast compression.
+The server targets IIIF Image API 3.0 `level2`. It supports `full`/`square`/`x,y,w,h`/
+`pct:x,y,w,h` regions; `max`, `full`, `w,`, `,h`, `!w,h`, `w,h`, and `pct:n` sizes; and the IIIF
+`^` size prefix for explicit upscaling. Rotation supports `0`, `90`, `180`, and `270` degrees plus
+IIIF mirroring with `!`. Qualities are `default`, `color`, `gray`, and `bitonal`; output formats are
+`png`, `jpg`/`jpeg`, and `webp`. The server emits IIIF `Link` headers for the level 2 profile and
+canonical image URI. WebP is currently encoded losslessly by the Rust `image` crate; JPEG uses
+`--quality` and PNG uses fast compression. See `IIIF_COMPLIANCE.md` for the detailed feature matrix.
 
 Server-only builds avoid the desktop GUI dependencies:
 
@@ -211,14 +214,35 @@ docker build -t gigatiff-server .
 docker run --rm -p 8080:8080 -v "$PWD/images:/data:ro" -v "$PWD/cache:/cache" gigatiff-server
 ```
 
-The included `docker-compose.yml` runs `gigatiff-server` behind Caddy:
+The included `docker-compose.yml` runs `gigatiff-server` behind Caddy on `127.0.0.1:18082`:
 
 ```bash
 mkdir -p images
 docker compose up --build
 ```
 
-Then open `http://localhost:8080/api/images` or a returned `viewer_url`.
+Then open `http://127.0.0.1:18082/api/images` or a returned `viewer_url`.
+
+### IIIF Smoke Test
+
+The IIIF smoke helper checks the advertised profile, JSON-LD media type, base URI redirect, CORS,
+profile/canonical `Link` headers, representative level 2 image requests, selected negative requests,
+and canonical cache-key reuse:
+
+```powershell
+.\scripts\iiif-smoke.ps1 -BaseUrl http://127.0.0.1:18082 -ImageId mapa2.tif
+```
+
+For CI or local testing without large sample images, generate a tiny baseline TIFF fixture and run
+the same smoke test with smaller regions:
+
+```powershell
+.\scripts\new-test-tiff.ps1 -OutPath images\ci-smoke.tif -Width 64 -Height 64
+.\scripts\iiif-smoke.ps1 -BaseUrl http://127.0.0.1:18082 -ImageId ci-smoke.tif -RegionSize 32 -OutputSize 16
+```
+
+GitHub Actions includes an `IIIF server smoke` job that generates this fixture, starts the Docker
+Compose stack, and runs the smoke test on pushes and pull requests.
 
 ### Server Benchmarks
 
@@ -582,9 +606,12 @@ cargo build --release
 
 - serves TIFF/BigTIFF files through a separate IIIF-compatible `gigatiff-server` binary,
 - provides a minimal OpenSeadragon browser viewer,
+- targets IIIF Image API 3.0 `level2` with region, size, rotation, mirroring, color/gray/bitonal
+  quality, profile-link, canonical-link, and base-URI redirect coverage,
 - emits PNG, JPEG, and WebP IIIF image responses,
-- supports persistent encoded response caching with size pruning,
+- supports persistent encoded response caching with size pruning and canonical IIIF cache keys,
 - exposes cache stats and manual cache purge endpoints,
+- includes a tiny generated TIFF fixture and IIIF smoke test for CI,
 - limits concurrent TIFF render jobs to avoid flooding libtiff during fast pan/zoom interaction,
 - includes Docker and Caddy configuration for local browser testing.
 
@@ -608,7 +635,8 @@ Useful next optimization steps for the desktop viewer:
 Useful next optimization steps for the image server:
 
 - run tile-size benchmark sweeps for WebP/JPEG/PNG and record the best default tile/output settings,
-- expand IIIF compliance coverage beyond `pct:` regions/sizes and add automated OpenSeadragon smoke tests,
+- add automated OpenSeadragon browser smoke tests on top of the current HTTP-level IIIF smoke test,
+- consider advertising a `sizes` array in `info.json` for common downsampled dimensions,
 - evaluate lossy WebP encoding options once the Rust ecosystem path is stable enough for release builds.
 
 Useful next deployment steps:

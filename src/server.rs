@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use axum::extract::{Path as AxumPath, State};
-use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, HOST};
+use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, HOST, LINK, LOCATION};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
@@ -127,6 +127,7 @@ struct ImageListItem {
     viewer_url: String,
 }
 
+#[derive(Clone)]
 enum ImageFormat {
     Png,
     Jpeg,
@@ -143,6 +144,7 @@ impl ImageFormat {
     }
 }
 
+#[derive(Clone)]
 struct IiifImageRequest {
     id: String,
     region: String,
@@ -150,6 +152,12 @@ struct IiifImageRequest {
     rotation: String,
     quality: String,
     format: ImageFormat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IiifRotation {
+    mirror: bool,
+    degrees: u16,
 }
 
 #[derive(Serialize)]
@@ -413,9 +421,20 @@ async fn iiif(
     }
 
     match parse_iiif_image_request(&tail) {
-        Ok(request) => iiif_image(state, request).await,
-        Err(err) => error_response(StatusCode::BAD_REQUEST, err),
+        Ok(request) => iiif_image(state, headers, request).await,
+        Err(err) => match resolve_id(&state.root, &tail) {
+            Ok(_) => iiif_base_redirect(&tail),
+            Err(_) => error_response(StatusCode::BAD_REQUEST, err),
+        },
     }
+}
+
+fn iiif_base_redirect(id: &str) -> Response {
+    let mut response = StatusCode::SEE_OTHER.into_response();
+    if let Ok(location) = HeaderValue::from_str(&format!("/iiif/3/{id}/info.json")) {
+        response.headers_mut().insert(LOCATION, location);
+    }
+    response
 }
 
 async fn iiif_info(state: Arc<AppState>, headers: HeaderMap, id: String) -> Response {
@@ -435,12 +454,23 @@ async fn iiif_info(state: Arc<AppState>, headers: HeaderMap, id: String) -> Resp
         "id": service_id,
         "type": "ImageService3",
         "protocol": "http://iiif.io/api/image",
-        "profile": "level1",
+        "profile": "level2",
         "width": info.width,
         "height": info.height,
+        "maxArea": state.max_output_pixels,
         "preferredFormats": ["webp", "png"],
         "extraFormats": ["webp", "png", "jpg"],
-        "qualities": ["default", "color"],
+        "extraFeatures": [
+            "baseUriRedirect",
+            "canonicalLinkHeader",
+            "cors",
+            "jsonldMediaType",
+            "mirroring",
+            "profileLinkHeader",
+            "rotationBy90s",
+            "sizeUpscaling"
+        ],
+        "qualities": ["default", "color", "gray", "bitonal"],
         "tiles": [{
             "width": state.tile_size,
             "height": state.tile_size,
@@ -459,10 +489,15 @@ async fn iiif_info(state: Arc<AppState>, headers: HeaderMap, id: String) -> Resp
         CACHE_CONTROL,
         HeaderValue::from_static("public, max-age=60"),
     );
+    insert_profile_link_header(response.headers_mut());
     response
 }
 
-async fn iiif_image(state: Arc<AppState>, request: IiifImageRequest) -> Response {
+async fn iiif_image(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    request: IiifImageRequest,
+) -> Response {
     let image_path = match resolve_id(&state.root, &request.id) {
         Ok(path) => path,
         Err(err) => return error_response(StatusCode::BAD_REQUEST, err),
@@ -526,6 +561,10 @@ async fn iiif_image(state: Arc<AppState>, request: IiifImageRequest) -> Response
                 CACHE_CONTROL,
                 HeaderValue::from_static("public, max-age=86400"),
             );
+            insert_image_link_header(
+                response.headers_mut(),
+                &format!("{}{}", request_origin(&headers), rendered.canonical_path),
+            );
             response
         }
         Err(err) => error_response(StatusCode::BAD_REQUEST, err),
@@ -536,6 +575,7 @@ struct RenderedResponse {
     bytes: Vec<u8>,
     content_type: &'static str,
     cache_status: &'static str,
+    canonical_path: String,
     timing: ResponseTiming,
 }
 
@@ -558,12 +598,15 @@ fn render_iiif_image(
     let mut timing = ResponseTiming::default();
     let info = load_cached_info_blocking(state, &image_path)?;
     let rect = parse_region(&request.region, &info)?;
-    let (out_width, out_height) = parse_size(&request.size, rect)?;
+    let (out_width, out_height) = parse_size(&request.size, rect, state.max_output_pixels)?;
+    let rotation = parse_rotation(&request.rotation)?;
+    let canonical_path =
+        canonical_image_path(&request, &rect, &info, out_width, out_height, rotation);
 
-    if request.rotation != "0" && request.rotation != "0.0" {
-        bail!("only rotation 0 is supported in this prototype");
-    }
-    if request.quality != "default" && request.quality != "color" {
+    if !matches!(
+        request.quality.as_str(),
+        "default" | "color" | "gray" | "bitonal"
+    ) {
         bail!("unsupported IIIF quality '{}'", request.quality);
     }
     if out_width as u64 * out_height as u64 > state.max_output_pixels as u64 {
@@ -579,7 +622,7 @@ fn render_iiif_image(
             &state.cache_dir,
             &image_path,
             &info,
-            &request,
+            &canonical_path,
             out_width,
             out_height,
             state,
@@ -592,6 +635,7 @@ fn render_iiif_image(
                 bytes,
                 content_type: content_type(&request.format),
                 cache_status: "hit",
+                canonical_path,
                 timing,
             });
         }
@@ -613,7 +657,7 @@ fn render_iiif_image(
         None,
     )?;
     timing.render = render_start.elapsed();
-    let rgba = if preview.width == out_width && preview.height == out_height {
+    let mut rgba = if preview.width == out_width && preview.height == out_height {
         preview.rgba
     } else {
         resize_nearest_rgba(
@@ -624,10 +668,17 @@ fn render_iiif_image(
             out_height,
         )
     };
+    let (final_width, final_height) = apply_geometry(&mut rgba, out_width, out_height, rotation);
+    apply_quality(&mut rgba, &request.quality);
 
     let encode_start = Instant::now();
-    let (bytes, content_type) =
-        encode_response(&request.format, out_width, out_height, &rgba, state.quality)?;
+    let (bytes, content_type) = encode_response(
+        &request.format,
+        final_width,
+        final_height,
+        &rgba,
+        state.quality,
+    )?;
     timing.encode = encode_start.elapsed();
     let cache_status = if let Some(cache_path) = cache_path {
         let store_start = Instant::now();
@@ -645,6 +696,7 @@ fn render_iiif_image(
         bytes,
         content_type,
         cache_status,
+        canonical_path,
         timing,
     })
 }
@@ -653,7 +705,7 @@ fn response_cache_path(
     cache_dir: &Path,
     image_path: &Path,
     info: &ImageInfo,
-    request: &IiifImageRequest,
+    canonical_path: &str,
     out_width: u32,
     out_height: u32,
     state: &AppState,
@@ -680,16 +732,15 @@ fn response_cache_path(
     hash.write_u64(info.chunk_height as u64);
     hash.write_u64(out_width as u64);
     hash.write_u64(out_height as u64);
-    hash.write_bytes(request.id.as_bytes());
-    hash.write_bytes(request.region.as_bytes());
-    hash.write_bytes(request.size.as_bytes());
-    hash.write_bytes(request.rotation.as_bytes());
-    hash.write_bytes(request.quality.as_bytes());
-    hash.write_bytes(request.format.extension().as_bytes());
+    hash.write_bytes(canonical_path.as_bytes());
     hash.write_u64(state.quality as u64);
     hash.write_bytes(format!("{:?}", state.backend).as_bytes());
 
-    let filename = format!("{:016x}.{}", hash.finish(), request.format.extension());
+    let extension = canonical_path
+        .rsplit_once('.')
+        .map(|(_, extension)| extension)
+        .unwrap_or("cache");
+    let filename = format!("{:016x}.{extension}", hash.finish());
     Ok(cache_dir.join(&filename[0..2]).join(filename))
 }
 
@@ -937,6 +988,22 @@ fn insert_ms_header(headers: &mut HeaderMap, name: &'static str, duration: Durat
     }
 }
 
+fn insert_profile_link_header(headers: &mut HeaderMap) {
+    headers.insert(
+        LINK,
+        HeaderValue::from_static("<http://iiif.io/api/image/3/level2.json>;rel=\"profile\""),
+    );
+}
+
+fn insert_image_link_header(headers: &mut HeaderMap, canonical_url: &str) {
+    let value = format!(
+        "<http://iiif.io/api/image/3/level2.json>;rel=\"profile\", <{canonical_url}>;rel=\"canonical\""
+    );
+    if let Ok(value) = HeaderValue::from_str(&value) {
+        headers.insert(LINK, value);
+    }
+}
+
 fn current_unix_secs() -> u64 {
     UNIX_EPOCH.elapsed().unwrap_or_default().as_secs()
 }
@@ -986,6 +1053,83 @@ fn parse_format(format: &str) -> Result<ImageFormat> {
     }
 }
 
+fn canonical_image_path(
+    request: &IiifImageRequest,
+    rect: &Rect,
+    info: &ImageInfo,
+    out_width: u32,
+    out_height: u32,
+    rotation: IiifRotation,
+) -> String {
+    format!(
+        "/iiif/3/{}/{}/{}/{}/{}.{}",
+        encode_id(&request.id),
+        canonical_region(rect, info),
+        canonical_size(&request.size, out_width, out_height),
+        canonical_rotation(rotation),
+        request.quality,
+        request.format.extension()
+    )
+}
+
+fn canonical_region(rect: &Rect, info: &ImageInfo) -> String {
+    if rect.x == 0 && rect.y == 0 && rect.width == info.width && rect.height == info.height {
+        "full".to_string()
+    } else {
+        format!("{},{},{},{}", rect.x, rect.y, rect.width, rect.height)
+    }
+}
+
+fn canonical_size(size: &str, out_width: u32, out_height: u32) -> String {
+    if size == "max" || size == "full" {
+        return "max".to_string();
+    }
+    if size == "^max" {
+        return "^max".to_string();
+    }
+
+    let prefix = if size.starts_with('^') { "^" } else { "" };
+    format!("{prefix}{out_width},{out_height}")
+}
+
+fn canonical_rotation(rotation: IiifRotation) -> String {
+    if rotation.mirror {
+        format!("!{}", rotation.degrees)
+    } else {
+        rotation.degrees.to_string()
+    }
+}
+
+fn parse_rotation(rotation: &str) -> Result<IiifRotation> {
+    let (mirror, value) = if let Some(value) = rotation.strip_prefix('!') {
+        (true, value)
+    } else {
+        (false, rotation)
+    };
+    let degrees: f64 = value
+        .parse()
+        .with_context(|| format!("invalid IIIF rotation '{rotation}'"))?;
+    if !degrees.is_finite() || !(0.0..=360.0).contains(&degrees) {
+        bail!("IIIF rotation must be between 0 and 360 degrees");
+    }
+
+    let normalized = if (degrees - 360.0).abs() < f64::EPSILON {
+        0.0
+    } else {
+        degrees
+    };
+    let rounded = normalized.round();
+    if (normalized - rounded).abs() > f64::EPSILON || !matches!(rounded as u16, 0 | 90 | 180 | 270)
+    {
+        bail!("only IIIF rotations 0, 90, 180, and 270 are supported");
+    }
+
+    Ok(IiifRotation {
+        mirror,
+        degrees: rounded as u16,
+    })
+}
+
 fn stale_cache_prune_instant() -> Instant {
     let now = Instant::now();
     now.checked_sub(Duration::from_secs(3600)).unwrap_or(now)
@@ -998,6 +1142,16 @@ fn parse_region(region: &str, info: &ImageInfo) -> Result<Rect> {
             y: 0,
             width: info.width,
             height: info.height,
+        });
+    }
+
+    if region == "square" {
+        let side = info.width.min(info.height);
+        return Ok(Rect {
+            x: (info.width - side) / 2,
+            y: (info.height - side) / 2,
+            width: side,
+            height: side,
         });
     }
 
@@ -1019,7 +1173,7 @@ fn parse_region(region: &str, info: &ImageInfo) -> Result<Rect> {
         .collect::<std::result::Result<_, _>>()
         .with_context(|| format!("invalid IIIF region '{region}'"))?;
     if parts.len() != 4 || parts[2] == 0 || parts[3] == 0 {
-        bail!("region must be full, max, or x,y,w,h");
+        bail!("region must be full, square, x,y,w,h, or pct:x,y,w,h");
     }
     clamp_rect(
         parts[0],
@@ -1031,19 +1185,23 @@ fn parse_region(region: &str, info: &ImageInfo) -> Result<Rect> {
     )
 }
 
-fn parse_size(size: &str, rect: Rect) -> Result<(u32, u32)> {
+fn parse_size(size: &str, rect: Rect, max_output_pixels: u32) -> Result<(u32, u32)> {
     if size == "max" || size == "full" {
-        return Ok((rect.width, rect.height));
+        return fit_to_max_area(rect.width, rect.height, max_output_pixels, false);
     }
 
     let allow_upscale = size.starts_with('^');
     let size = size.strip_prefix('^').unwrap_or(size);
+    if allow_upscale && size == "max" {
+        return fit_to_max_area(rect.width, rect.height, max_output_pixels, true);
+    }
+
     let constrained = size.strip_prefix('!').unwrap_or(size);
     if let Some(percent_size) = constrained.strip_prefix("pct:") {
         let scale = parse_percentage(percent_size, "size")? / 100.0;
         return constrain_size(
-            ((rect.width as f64 * scale).floor() as u32).max(1),
-            ((rect.height as f64 * scale).floor() as u32).max(1),
+            scaled_by_float(rect.width, scale),
+            scaled_by_float(rect.height, scale),
             rect,
             allow_upscale,
         );
@@ -1076,17 +1234,57 @@ fn parse_size(size: &str, rect: Rect) -> Result<(u32, u32)> {
 }
 
 fn constrain_size(width: u32, height: u32, rect: Rect, allow_upscale: bool) -> Result<(u32, u32)> {
-    if allow_upscale || width <= rect.width && height <= rect.height {
-        return Ok((width.max(1), height.max(1)));
+    if width == 0 || height == 0 {
+        bail!("IIIF output width and height must be greater than zero");
+    }
+    if !allow_upscale && (width > rect.width || height > rect.height) {
+        bail!("IIIF size requests that upscale must use the ^ prefix");
     }
 
-    let width_scale = rect.width as f64 / width as f64;
-    let height_scale = rect.height as f64 / height as f64;
-    let scale = width_scale.min(height_scale);
-    Ok((
-        ((width as f64 * scale).floor() as u32).max(1),
-        ((height as f64 * scale).floor() as u32).max(1),
-    ))
+    Ok((width, height))
+}
+
+fn fit_to_max_area(
+    width: u32,
+    height: u32,
+    max_area: u32,
+    allow_upscale: bool,
+) -> Result<(u32, u32)> {
+    if width == 0 || height == 0 || max_area == 0 {
+        bail!("IIIF output width, height, and max area must be greater than zero");
+    }
+
+    let area = width as u64 * height as u64;
+    if area == max_area as u64 || area < max_area as u64 && !allow_upscale {
+        return Ok((width, height));
+    }
+
+    let scale = (max_area as f64 / area as f64).sqrt();
+    let scaled_width = scaled_by_float(width, scale);
+    let scaled_height = scaled_by_float(height, scale);
+    constrain_area(scaled_width, scaled_height, max_area)
+}
+
+fn constrain_area(mut width: u32, mut height: u32, max_area: u32) -> Result<(u32, u32)> {
+    if width == 0 || height == 0 {
+        bail!("IIIF output width and height must be greater than zero");
+    }
+
+    while width as u64 * height as u64 > max_area as u64 {
+        if width >= height {
+            width -= 1;
+        } else {
+            height -= 1;
+        }
+    }
+    Ok((width, height))
+}
+
+fn scaled_by_float(value: u32, scale: f64) -> u32 {
+    if !scale.is_finite() || scale < 0.0 {
+        return 0;
+    }
+    (value as f64 * scale).floor().clamp(0.0, u32::MAX as f64) as u32
 }
 
 fn parse_percentage_parts(value: &str, expected: usize, label: &str) -> Result<Vec<f64>> {
@@ -1205,6 +1403,119 @@ fn rgba_to_rgb(rgba: &[u8]) -> Vec<u8> {
         rgb.extend_from_slice(&pixel[0..3]);
     }
     rgb
+}
+
+fn apply_geometry(
+    rgba: &mut Vec<u8>,
+    width: u32,
+    height: u32,
+    rotation: IiifRotation,
+) -> (u32, u32) {
+    if rotation.mirror {
+        mirror_horizontal_rgba(rgba, width, height);
+    }
+
+    match rotation.degrees {
+        0 => (width, height),
+        90 => {
+            *rgba = rotate_90_rgba(rgba, width, height);
+            (height, width)
+        }
+        180 => {
+            *rgba = rotate_180_rgba(rgba, width, height);
+            (width, height)
+        }
+        270 => {
+            *rgba = rotate_270_rgba(rgba, width, height);
+            (height, width)
+        }
+        _ => unreachable!("parse_rotation only allows right-angle rotations"),
+    }
+}
+
+fn mirror_horizontal_rgba(rgba: &mut [u8], width: u32, height: u32) {
+    let row_len = width as usize * 4;
+    for y in 0..height as usize {
+        let row = &mut rgba[y * row_len..(y + 1) * row_len];
+        for x in 0..width as usize / 2 {
+            let left = x * 4;
+            let right = (width as usize - 1 - x) * 4;
+            for channel in 0..4 {
+                row.swap(left + channel, right + channel);
+            }
+        }
+    }
+}
+
+fn rotate_90_rgba(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let mut rotated = vec![255u8; rgba.len()];
+    let dst_width = height as usize;
+    for y in 0..height as usize {
+        for x in 0..width as usize {
+            let src = (y * width as usize + x) * 4;
+            let dst_x = height as usize - 1 - y;
+            let dst_y = x;
+            let dst = (dst_y * dst_width + dst_x) * 4;
+            rotated[dst..dst + 4].copy_from_slice(&rgba[src..src + 4]);
+        }
+    }
+    rotated
+}
+
+fn rotate_180_rgba(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let mut rotated = vec![255u8; rgba.len()];
+    for y in 0..height as usize {
+        for x in 0..width as usize {
+            let src = (y * width as usize + x) * 4;
+            let dst_x = width as usize - 1 - x;
+            let dst_y = height as usize - 1 - y;
+            let dst = (dst_y * width as usize + dst_x) * 4;
+            rotated[dst..dst + 4].copy_from_slice(&rgba[src..src + 4]);
+        }
+    }
+    rotated
+}
+
+fn rotate_270_rgba(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let mut rotated = vec![255u8; rgba.len()];
+    let dst_width = height as usize;
+    for y in 0..height as usize {
+        for x in 0..width as usize {
+            let src = (y * width as usize + x) * 4;
+            let dst_x = y;
+            let dst_y = width as usize - 1 - x;
+            let dst = (dst_y * dst_width + dst_x) * 4;
+            rotated[dst..dst + 4].copy_from_slice(&rgba[src..src + 4]);
+        }
+    }
+    rotated
+}
+
+fn apply_quality(rgba: &mut [u8], quality: &str) {
+    match quality {
+        "default" | "color" => {}
+        "gray" => {
+            for pixel in rgba.chunks_exact_mut(4) {
+                let gray = luminance(pixel);
+                pixel[0] = gray;
+                pixel[1] = gray;
+                pixel[2] = gray;
+            }
+        }
+        "bitonal" => {
+            for pixel in rgba.chunks_exact_mut(4) {
+                let value = if luminance(pixel) >= 128 { 255 } else { 0 };
+                pixel[0] = value;
+                pixel[1] = value;
+                pixel[2] = value;
+            }
+        }
+        _ => unreachable!("render_iiif_image validates quality"),
+    }
+}
+
+fn luminance(pixel: &[u8]) -> u8 {
+    ((u16::from(pixel[0]) * 30 + u16::from(pixel[1]) * 59 + u16::from(pixel[2]) * 11) / 100) as u8
 }
 
 fn resize_nearest_rgba(
@@ -1383,6 +1694,111 @@ mod tests {
     }
 
     #[test]
+    fn parses_right_angle_rotation_and_mirroring() {
+        assert_eq!(
+            parse_rotation("90").unwrap(),
+            IiifRotation {
+                mirror: false,
+                degrees: 90
+            }
+        );
+        assert_eq!(
+            parse_rotation("!270").unwrap(),
+            IiifRotation {
+                mirror: true,
+                degrees: 270
+            }
+        );
+        assert_eq!(parse_rotation("360").unwrap().degrees, 0);
+        assert!(parse_rotation("45").is_err());
+        assert!(parse_rotation("361").is_err());
+    }
+
+    #[test]
+    fn applies_mirroring_before_rotation() {
+        let red = [255, 0, 0, 255];
+        let green = [0, 255, 0, 255];
+        let blue = [0, 0, 255, 255];
+        let white = [255, 255, 255, 255];
+        let mut rgba = [red, green, blue, white].concat();
+
+        let (width, height) = apply_geometry(
+            &mut rgba,
+            2,
+            2,
+            IiifRotation {
+                mirror: true,
+                degrees: 90,
+            },
+        );
+
+        assert_eq!((width, height), (2, 2));
+        assert_eq!(rgba, [white, green, blue, red].concat());
+    }
+
+    #[test]
+    fn applies_gray_and_bitonal_quality() {
+        let mut gray = vec![10, 20, 30, 255, 200, 200, 200, 128];
+        apply_quality(&mut gray, "gray");
+        assert_eq!(gray, vec![18, 18, 18, 255, 200, 200, 200, 128]);
+
+        let mut bitonal = vec![10, 20, 30, 255, 200, 200, 200, 128];
+        apply_quality(&mut bitonal, "bitonal");
+        assert_eq!(bitonal, vec![0, 0, 0, 255, 255, 255, 255, 128]);
+    }
+
+    #[test]
+    fn iiif_base_redirect_points_to_info_json() {
+        let response = iiif_base_redirect("folder/map.tif");
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers().get(LOCATION).unwrap(),
+            "/iiif/3/folder/map.tif/info.json"
+        );
+    }
+
+    #[test]
+    fn canonical_image_path_normalizes_region_size_rotation_and_format() {
+        let info = dummy_info();
+        let request = IiifImageRequest {
+            id: "folder/map.tif".to_string(),
+            region: "pct:25,25,50,50".to_string(),
+            size: "1024,".to_string(),
+            rotation: "!90".to_string(),
+            quality: "default".to_string(),
+            format: ImageFormat::Jpeg,
+        };
+        let rect = parse_region(&request.region, &info).unwrap();
+        let (out_width, out_height) = parse_size(&request.size, rect, 16_777_216).unwrap();
+        let rotation = parse_rotation(&request.rotation).unwrap();
+
+        assert_eq!(
+            canonical_image_path(&request, &rect, &info, out_width, out_height, rotation),
+            "/iiif/3/folder%2Fmap.tif/1024,512,2048,1024/1024,512/!90/default.jpg"
+        );
+    }
+
+    #[test]
+    fn inserts_iiif_link_headers() {
+        let mut headers = HeaderMap::new();
+        insert_profile_link_header(&mut headers);
+        assert_eq!(
+            headers.get(LINK).unwrap(),
+            "<http://iiif.io/api/image/3/level2.json>;rel=\"profile\""
+        );
+
+        insert_image_link_header(
+            &mut headers,
+            "http://example.test/iiif/3/map.tif/full/max/0/default.jpg",
+        );
+        assert_eq!(
+            headers.get(LINK).unwrap(),
+            "<http://iiif.io/api/image/3/level2.json>;rel=\"profile\", <http://example.test/iiif/3/map.tif/full/max/0/default.jpg>;rel=\"canonical\""
+        );
+    }
+
+    #[test]
     fn parses_bounding_box_size() {
         let rect = Rect {
             x: 0,
@@ -1390,13 +1806,25 @@ mod tests {
             width: 4000,
             height: 2000,
         };
-        assert_eq!(parse_size("!512,512", rect).unwrap(), (512, 256));
+        assert_eq!(
+            parse_size("!512,512", rect, 16_777_216).unwrap(),
+            (512, 256)
+        );
     }
 
     #[test]
-    fn parses_percentage_region() {
+    fn parses_square_and_percentage_regions() {
         let info = dummy_info();
 
+        assert_eq!(
+            parse_region("square", &info).unwrap(),
+            Rect {
+                x: 1024,
+                y: 0,
+                width: 2048,
+                height: 2048,
+            }
+        );
         assert_eq!(
             parse_region("pct:25,25,50,50", &info).unwrap(),
             Rect {
@@ -1418,7 +1846,27 @@ mod tests {
     }
 
     #[test]
-    fn parses_percentage_and_upscale_sizes() {
+    fn clips_regions_at_image_edges_and_rejects_empty_regions() {
+        let info = dummy_info();
+
+        assert_eq!(
+            parse_region("4000,2000,500,500", &info).unwrap(),
+            Rect {
+                x: 4000,
+                y: 2000,
+                width: 96,
+                height: 48,
+            }
+        );
+        assert!(parse_region("4096,0,1,1", &info).is_err());
+        assert!(parse_region("0,2048,1,1", &info).is_err());
+        assert!(parse_region("0,0,0,1", &info).is_err());
+        assert!(parse_region("pct:100,0,10,10", &info).is_err());
+        assert!(parse_region("pct:0,0,0,10", &info).is_err());
+    }
+
+    #[test]
+    fn parses_iiif_size_forms() {
         let rect = Rect {
             x: 0,
             y: 0,
@@ -1426,13 +1874,82 @@ mod tests {
             height: 2000,
         };
 
-        assert_eq!(parse_size("pct:50", rect).unwrap(), (2000, 1000));
-        assert_eq!(parse_size("pct:200", rect).unwrap(), (4000, 2000));
-        assert_eq!(parse_size("^pct:200", rect).unwrap(), (8000, 4000));
-        assert_eq!(parse_size("8000,", rect).unwrap(), (4000, 2000));
-        assert_eq!(parse_size("^8000,", rect).unwrap(), (8000, 4000));
-        assert_eq!(parse_size("!8000,8000", rect).unwrap(), (4000, 2000));
-        assert_eq!(parse_size("^!8000,8000", rect).unwrap(), (8000, 4000));
+        assert_eq!(parse_size("max", rect, 8_000_000).unwrap(), (4000, 2000));
+        assert_eq!(parse_size("full", rect, 8_000_000).unwrap(), (4000, 2000));
+        assert_eq!(parse_size("max", rect, 2_000_000).unwrap(), (2000, 1000));
+        assert_eq!(
+            parse_size("pct:50", rect, 16_777_216).unwrap(),
+            (2000, 1000)
+        );
+        assert_eq!(parse_size("2000,", rect, 16_777_216).unwrap(), (2000, 1000));
+        assert_eq!(parse_size(",1000", rect, 16_777_216).unwrap(), (2000, 1000));
+        assert_eq!(
+            parse_size("2000,1000", rect, 16_777_216).unwrap(),
+            (2000, 1000)
+        );
+        assert_eq!(
+            parse_size("1000,1000", rect, 16_777_216).unwrap(),
+            (1000, 1000)
+        );
+        assert_eq!(
+            parse_size("!512,512", rect, 16_777_216).unwrap(),
+            (512, 256)
+        );
+    }
+
+    #[test]
+    fn parses_upscale_size_forms_with_caret() {
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: 4000,
+            height: 2000,
+        };
+        let small = Rect {
+            x: 0,
+            y: 0,
+            width: 1000,
+            height: 500,
+        };
+
+        assert_eq!(parse_size("^max", small, 2_000_000).unwrap(), (2000, 1000));
+        assert_eq!(
+            parse_size("^pct:200", rect, 64_000_000).unwrap(),
+            (8000, 4000)
+        );
+        assert_eq!(
+            parse_size("^8000,", rect, 64_000_000).unwrap(),
+            (8000, 4000)
+        );
+        assert_eq!(
+            parse_size("^,4000", rect, 64_000_000).unwrap(),
+            (8000, 4000)
+        );
+        assert_eq!(
+            parse_size("^8000,4000", rect, 64_000_000).unwrap(),
+            (8000, 4000)
+        );
+        assert_eq!(
+            parse_size("^!8000,8000", rect, 64_000_000).unwrap(),
+            (8000, 4000)
+        );
+    }
+
+    #[test]
+    fn rejects_size_upscaling_without_caret() {
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: 4000,
+            height: 2000,
+        };
+
+        assert!(parse_size("pct:200", rect, 64_000_000).is_err());
+        assert!(parse_size("8000,", rect, 64_000_000).is_err());
+        assert!(parse_size(",4000", rect, 64_000_000).is_err());
+        assert!(parse_size("8000,4000", rect, 64_000_000).is_err());
+        assert!(parse_size("!8000,8000", rect, 64_000_000).is_err());
+        assert!(parse_size("pct:0", rect, 64_000_000).is_err());
     }
 
     #[test]
@@ -1449,56 +1966,91 @@ mod tests {
         fs::write(&image_path, b"dummy").unwrap();
         let state = dummy_state(temp.join("cache"));
         let info = dummy_info();
-        let first = IiifImageRequest {
+
+        let full = IiifImageRequest {
             id: "map.tif".to_string(),
-            region: "0,0,512,512".to_string(),
-            size: "128,".to_string(),
+            region: "full".to_string(),
+            size: "max".to_string(),
             rotation: "0".to_string(),
             quality: "default".to_string(),
             format: ImageFormat::Webp,
         };
-        let second = IiifImageRequest {
-            size: "256,".to_string(),
-            ..first
+        let pixel_equivalent = IiifImageRequest {
+            region: "0,0,4096,2048".to_string(),
+            size: "full".to_string(),
+            ..full.clone()
         };
+        let full_rect = parse_region(&full.region, &info).unwrap();
+        let (full_width, full_height) = parse_size(&full.size, full_rect, 16_777_216).unwrap();
+        let full_canonical = canonical_image_path(
+            &full,
+            &full_rect,
+            &info,
+            full_width,
+            full_height,
+            parse_rotation(&full.rotation).unwrap(),
+        );
+        let equivalent_rect = parse_region(&pixel_equivalent.region, &info).unwrap();
+        let (equivalent_width, equivalent_height) =
+            parse_size(&pixel_equivalent.size, equivalent_rect, 16_777_216).unwrap();
+        let equivalent_canonical = canonical_image_path(
+            &pixel_equivalent,
+            &equivalent_rect,
+            &info,
+            equivalent_width,
+            equivalent_height,
+            parse_rotation(&pixel_equivalent.rotation).unwrap(),
+        );
+        assert_eq!(full_canonical, equivalent_canonical);
 
-        let first_path = response_cache_path(
+        let full_path = response_cache_path(
             &state.cache_dir,
             &image_path,
             &info,
-            &second,
-            256,
-            256,
+            &full_canonical,
+            full_width,
+            full_height,
             &state,
         )
         .unwrap();
-        let second_path = response_cache_path(
+        let equivalent_path = response_cache_path(
             &state.cache_dir,
             &image_path,
             &info,
-            &second,
-            256,
-            256,
+            &equivalent_canonical,
+            equivalent_width,
+            equivalent_height,
             &state,
         )
         .unwrap();
-        assert_eq!(first_path, second_path);
+        assert_eq!(full_path, equivalent_path);
 
         let changed = IiifImageRequest {
-            size: "128,".to_string(),
-            ..second
+            size: "1024,".to_string(),
+            ..full
         };
+        let changed_rect = parse_region(&changed.region, &info).unwrap();
+        let (changed_width, changed_height) =
+            parse_size(&changed.size, changed_rect, 16_777_216).unwrap();
+        let changed_canonical = canonical_image_path(
+            &changed,
+            &changed_rect,
+            &info,
+            changed_width,
+            changed_height,
+            parse_rotation(&changed.rotation).unwrap(),
+        );
         let changed_path = response_cache_path(
             &state.cache_dir,
             &image_path,
             &info,
-            &changed,
-            128,
-            128,
+            &changed_canonical,
+            changed_width,
+            changed_height,
             &state,
         )
         .unwrap();
-        assert_ne!(first_path, changed_path);
+        assert_ne!(full_path, changed_path);
 
         let _ = fs::remove_dir_all(temp);
     }
