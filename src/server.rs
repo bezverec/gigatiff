@@ -471,6 +471,7 @@ async fn iiif_info(state: Arc<AppState>, headers: HeaderMap, id: String) -> Resp
             "sizeUpscaling"
         ],
         "qualities": ["default", "color", "gray", "bitonal"],
+        "sizes": preferred_sizes(info.width, info.height, state.max_output_pixels),
         "tiles": [{
             "width": state.tile_size,
             "height": state.tile_size,
@@ -1667,6 +1668,38 @@ fn scale_factors(width: u32, height: u32) -> Vec<u32> {
     factors
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct IiifSize {
+    width: u32,
+    height: u32,
+}
+
+fn preferred_sizes(width: u32, height: u32, max_area: u32) -> Vec<IiifSize> {
+    let mut factors = Vec::new();
+    let mut factor = 1u32;
+    let max_factor = width.min(height).max(1);
+    while factor <= max_factor {
+        factors.push(factor);
+        if factor > u32::MAX / 2 {
+            break;
+        }
+        factor *= 2;
+    }
+
+    let mut sizes = Vec::new();
+    for factor in factors.into_iter().rev() {
+        let size = IiifSize {
+            width: (width / factor).max(1),
+            height: (height / factor).max(1),
+        };
+        if size.width as u64 * size.height as u64 <= max_area as u64 && sizes.last() != Some(&size)
+        {
+            sizes.push(size);
+        }
+    }
+    sizes
+}
+
 fn is_tiff_path(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
@@ -1795,6 +1828,70 @@ mod tests {
         assert_eq!(
             headers.get(LINK).unwrap(),
             "<http://iiif.io/api/image/3/level2.json>;rel=\"profile\", <http://example.test/iiif/3/map.tif/full/max/0/default.jpg>;rel=\"canonical\""
+        );
+    }
+
+    #[test]
+    fn preferred_sizes_are_full_image_variants_within_area_limits() {
+        assert_eq!(
+            preferred_sizes(4096, 2048, 16_777_216),
+            vec![
+                IiifSize {
+                    width: 2,
+                    height: 1
+                },
+                IiifSize {
+                    width: 4,
+                    height: 2
+                },
+                IiifSize {
+                    width: 8,
+                    height: 4
+                },
+                IiifSize {
+                    width: 16,
+                    height: 8
+                },
+                IiifSize {
+                    width: 32,
+                    height: 16
+                },
+                IiifSize {
+                    width: 64,
+                    height: 32
+                },
+                IiifSize {
+                    width: 128,
+                    height: 64
+                },
+                IiifSize {
+                    width: 256,
+                    height: 128
+                },
+                IiifSize {
+                    width: 512,
+                    height: 256
+                },
+                IiifSize {
+                    width: 1024,
+                    height: 512
+                },
+                IiifSize {
+                    width: 2048,
+                    height: 1024
+                },
+                IiifSize {
+                    width: 4096,
+                    height: 2048
+                },
+            ]
+        );
+
+        assert_eq!(
+            preferred_sizes(4096, 2048, 1_048_576)
+                .last()
+                .map(|size| (size.width, size.height)),
+            Some((1024, 512))
         );
     }
 

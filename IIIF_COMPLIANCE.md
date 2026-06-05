@@ -16,10 +16,10 @@ The server advertises only optional features it implements.
 
 | Area | Feature | Status | Notes |
 | --- | --- | --- | --- |
-| Information | `info.json` | Supported | Returns `ImageService3`, JSON-LD content type, dimensions, tiles, `maxArea`, formats, qualities, and extra features. |
+| Information | `info.json` | Supported | Returns `ImageService3`, JSON-LD content type, dimensions, preferred sizes, tiles, `maxArea`, formats, qualities, and extra features. |
 | Information | `profile: level2` | Supported | Advertised when the server is built with the current server implementation. |
 | Information | `tiles` | Supported | Advertises square tiles with powers-of-two scale factors. |
-| Information | `sizes` | Not advertised | The server supports arbitrary sizes within limits, so fixed preferred sizes are not currently listed. |
+| Information | `sizes` | Supported | Advertises powers-of-two full-image variants that stay within `maxArea`. |
 | Region | `full` | Supported | Required at all levels. |
 | Region | `x,y,w,h` | Supported | Crops to image edge when the region extends beyond bounds. Empty/out-of-bounds regions return `400`. |
 | Region | `pct:x,y,w,h` | Supported | Converted to pixel coordinates and clipped consistently with pixel regions. |
