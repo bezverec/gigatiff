@@ -75,8 +75,8 @@ jobs:
       - name: Test
         run: cargo test --locked
 
-      - name: Build release binary
-        run: cargo build --release --locked --bins
+      - name: Build desktop release binary
+        run: cargo build --release --locked --bin gigatiff
 
       - name: Package Windows archive
         if: runner.os == 'Windows'
@@ -87,7 +87,6 @@ jobs:
           $packageDir = Join-Path "dist" $packageName
           New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
           Copy-Item "target\release\gigatiff.exe" $packageDir
-          Copy-Item "target\release\gigatiff-server.exe" $packageDir
           Copy-Item "README.md", "LICENSE" $packageDir
           $vcpkgBin = Join-Path $env:VCPKG_INSTALLATION_ROOT "installed\x64-windows\bin"
           Copy-Item (Join-Path $vcpkgBin "*.dll") $packageDir -ErrorAction SilentlyContinue
@@ -102,7 +101,6 @@ jobs:
           package_dir="dist/$package_name"
           mkdir -p "$package_dir"
           cp target/release/gigatiff "$package_dir/"
-          cp target/release/gigatiff-server "$package_dir/"
           cp README.md LICENSE "$package_dir/"
 
           if [ "${{ runner.os }}" = "macOS" ]; then
@@ -204,9 +202,9 @@ jobs:
 
             Included archives:
 
-            - `gigatiff-${{ github.ref_name }}-windows-x64.zip` with `gigatiff.exe`, `gigatiff-server.exe`, and required vcpkg DLLs.
-            - `gigatiff-${{ github.ref_name }}-linux-x64.zip` with the Linux desktop/server binaries and a `GigaTIFF.desktop` launcher.
-            - `gigatiff-${{ github.ref_name }}-macos.zip` with the macOS desktop/server binaries and a `GigaTIFF.app` bundle for Finder launch.
+            - `gigatiff-${{ github.ref_name }}-windows-x64.zip` with `gigatiff.exe` and required vcpkg DLLs.
+            - `gigatiff-${{ github.ref_name }}-linux-x64.zip` with the Linux desktop binary and a `GigaTIFF.desktop` launcher.
+            - `gigatiff-${{ github.ref_name }}-macos.zip` with the macOS desktop binary and a `GigaTIFF.app` bundle for Finder launch.
 
             Source code archives are provided automatically by GitHub.
           files: dist/*.zip

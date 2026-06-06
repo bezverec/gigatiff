@@ -4,8 +4,8 @@ A memory-conscious TIFF and BigTIFF viewer prototype written in Rust.
 
 The project has two application surfaces:
 
-- a desktop viewer, exposed as `gigatiff`, with GUI, metadata, and PNG preview/export commands,
-- a separate IIIF-compatible image server, exposed as `gigatiff-server`, for browser-based viewing.
+- a cross-platform desktop viewer, exposed as `gigatiff`, with GUI, metadata, and PNG preview/export commands,
+- a Linux/container-targeted IIIF-compatible image server, exposed as `gigatiff-server`, for browser-based viewing.
 
 The default pixel backend is `auto`: it prefers direct raw-strip reads for suitable uncompressed
 stripped TIFFs and falls back to `libtiff` scanlines for broader TIFF support. A pure Rust TIFF path
@@ -48,10 +48,11 @@ Executables:
 
 ```text
 target\debug\gigatiff.exe
-target\debug\gigatiff-server.exe
 target\release\gigatiff.exe
-target\release\gigatiff-server.exe
 ```
+
+The default Cargo feature set builds the desktop application only. The server binary is built
+explicitly with `--no-default-features --features server`.
 
 The build script copies `tiff.dll` next to the executable in `target/debug` or `target/release`.
 
@@ -63,9 +64,9 @@ manually to test packaging, and it also runs automatically for tags matching `v*
 The first release line is intentionally published as a prerelease. It produces three archives from
 the same tag:
 
-- `gigatiff-<version>-windows-x64.zip` with `gigatiff.exe`, `gigatiff-server.exe`, and vcpkg DLLs,
-- `gigatiff-<version>-linux-x64.zip` with the Linux desktop/server binaries, a `GigaTIFF.desktop` launcher, README, and license,
-- `gigatiff-<version>-macos.zip` with the macOS desktop/server binaries, a `GigaTIFF.app` bundle, README, and license.
+- `gigatiff-<version>-windows-x64.zip` with `gigatiff.exe` and vcpkg DLLs,
+- `gigatiff-<version>-linux-x64.zip` with the Linux desktop binary, a `GigaTIFF.desktop` launcher, README, and license,
+- `gigatiff-<version>-macos.zip` with the macOS desktop binary, a `GigaTIFF.app` bundle, README, and license.
 
 The Windows archive is closest to download-and-run. On macOS, launch `GigaTIFF.app` to start the GUI
 without opening Terminal. On Linux, use the included `.desktop` launcher or install it into the
@@ -143,8 +144,10 @@ target\debug\gigatiff.exe preview mapa2.tif --backend libtiff --x 0 --y 0 --widt
 
 ## Server Application
 
-The server side is intentionally separate from the desktop viewer. It reuses the same TIFF rendering
-pipeline, but exposes it through HTTP, IIIF-style image URLs, and a browser viewer.
+The server side is intentionally separate from the desktop viewer. It targets Linux deployment,
+primarily through Docker or Podman, and is not part of the cross-platform desktop release archives. It
+reuses the same TIFF rendering pipeline, but exposes it through HTTP, IIIF-style image URLs, and a
+browser viewer.
 
 ### Running the Image Server
 
@@ -152,8 +155,9 @@ pipeline, but exposes it through HTTP, IIIF-style image URLs, and a browser view
 under a root directory through a small IIIF Image API 3.0-compatible surface and includes a minimal
 OpenSeadragon viewer.
 
-```powershell
-target\debug\gigatiff-server.exe --root C:\path\to\tiffs --addr 127.0.0.1:8080
+```bash
+cargo build --release --bin gigatiff-server --no-default-features --features server
+target/release/gigatiff-server --root /path/to/tiffs --addr 127.0.0.1:8080
 ```
 
 The server stores encoded IIIF region/tile responses in a persistent cache. By default this is
@@ -200,9 +204,10 @@ requests that stay within `maxArea`. The server emits IIIF `Link` headers for th
 and canonical image URI. WebP is currently encoded losslessly by the Rust `image` crate; JPEG uses
 `--quality` and PNG uses fast compression. See `IIIF_COMPLIANCE.md` for the detailed feature matrix.
 
-Server-only builds avoid the desktop GUI dependencies:
+Server-only builds avoid the desktop GUI dependencies and are the expected native build mode on
+Linux:
 
-```powershell
+```bash
 cargo build --release --bin gigatiff-server --no-default-features --features server
 ```
 
@@ -356,8 +361,9 @@ tower-http = 0.6.11
 ```
 
 Desktop-specific dependencies are behind the `desktop` feature, and server-specific HTTP/encoding
-dependencies are behind the `server` feature. The default build enables both so CI checks both
-binaries.
+dependencies are behind the `server` feature. The default build enables only `desktop`; CI checks the
+desktop app on Windows, Linux, and macOS, and checks the server path on Linux through a server-only
+build plus Docker-based IIIF smoke test.
 
 ## Color Management
 

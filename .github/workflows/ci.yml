@@ -66,14 +66,11 @@ jobs:
       - name: Check
         run: cargo check --locked
 
-      - name: Check server-only build
-        run: cargo check --bin gigatiff-server --no-default-features --features server --locked
-
       - name: Test
         run: cargo test --locked
 
-      - name: Release build
-        run: cargo build --release --locked --bins
+      - name: Desktop release build
+        run: cargo build --release --locked --bin gigatiff
 
   iiif-smoke:
     name: IIIF server smoke

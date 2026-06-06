@@ -4,7 +4,7 @@ version = "0.2.0"
 edition = "2024"
 
 [features]
-default = ["desktop", "server"]
+default = ["desktop"]
 desktop = ["dep:eframe", "dep:rfd"]
 server = [
     "dep:axum",
@@ -32,6 +32,11 @@ serde_json = { version = "1.0.150", optional = true }
 tiff = "0.11.3"
 tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "signal", "sync"], optional = true }
 tower-http = { version = "0.6.11", features = ["cors", "trace"], optional = true }
+
+[[bin]]
+name = "gigatiff-server"
+path = "src/bin/gigatiff-server.rs"
+required-features = ["server"]
 
 [profile.release]
 opt-level = 3
