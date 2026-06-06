@@ -1,8 +1,12 @@
 use std::collections::HashMap;
+#[cfg(feature = "jpeg2000-grok")]
+use std::ffi::OsString;
 use std::fs;
 use std::io::Cursor;
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
+#[cfg(feature = "jpeg2000-grok")]
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -25,7 +29,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::options::{Backend, PngCompression};
-use crate::render::{Rect, clamp_rect, render_preview};
+use crate::render::{PreviewBitmap, Rect, RenderStats, clamp_rect, render_preview};
 use crate::tiff_info::{ImageInfo, load_info};
 
 const ID_ENCODE_SET: &AsciiSet = &CONTROLS
@@ -46,10 +50,10 @@ const ID_ENCODE_SET: &AsciiSet = &CONTROLS
 #[command(
     author,
     version,
-    about = "GigaTIFF Server: an IIIF-compatible TIFF/BigTIFF image server"
+    about = "GigaTIFF Server: an IIIF-compatible TIFF/BigTIFF/JPEG2000 image server"
 )]
 struct ServerCli {
-    /// Directory containing TIFF/BigTIFF files exposed by the server.
+    /// Directory containing TIFF/BigTIFF/JPEG2000 files exposed by the server.
     #[arg(long, default_value = ".")]
     root: PathBuf,
 
@@ -89,7 +93,7 @@ struct ServerCli {
     #[arg(long, default_value_t = 60)]
     cache_prune_interval_sec: u64,
 
-    /// Maximum number of concurrent TIFF render jobs.
+    /// Maximum number of concurrent render jobs.
     #[arg(long, default_value_t = 4)]
     max_concurrent_renders: usize,
 }
@@ -108,7 +112,46 @@ struct AppState {
     last_cache_prune: Arc<Mutex<Instant>>,
     last_cache_prune_report: Arc<Mutex<CachePruneReport>>,
     render_permits: Arc<Semaphore>,
-    info_cache: Arc<Mutex<HashMap<PathBuf, Arc<ImageInfo>>>>,
+    info_cache: Arc<Mutex<HashMap<PathBuf, Arc<ServerImageInfo>>>>,
+}
+
+#[derive(Debug, Clone)]
+struct ServerImageInfo {
+    width: u32,
+    height: u32,
+    source: ServerImageSource,
+}
+
+impl ServerImageInfo {
+    fn from_tiff(info: ImageInfo) -> Self {
+        Self {
+            width: info.width,
+            height: info.height,
+            source: ServerImageSource::Tiff(info),
+        }
+    }
+
+    fn source_label(&self) -> &'static str {
+        match &self.source {
+            ServerImageSource::Tiff(_) => "tiff",
+            #[cfg(feature = "jpeg2000-grok")]
+            ServerImageSource::Jpeg2000(_) => "jpeg2000-grok",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum ServerImageSource {
+    Tiff(ImageInfo),
+    #[cfg(feature = "jpeg2000-grok")]
+    Jpeg2000(Jpeg2000Info),
+}
+
+#[cfg(feature = "jpeg2000-grok")]
+#[derive(Debug, Clone, Copy, Default)]
+struct Jpeg2000Info {
+    components: Option<u32>,
+    precision: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -598,11 +641,18 @@ fn render_iiif_image(
     let total_start = Instant::now();
     let mut timing = ResponseTiming::default();
     let info = load_cached_info_blocking(state, &image_path)?;
-    let rect = parse_region(&request.region, &info)?;
+    let rect = parse_region(&request.region, info.width, info.height)?;
     let (out_width, out_height) = parse_size(&request.size, rect, state.max_output_pixels)?;
     let rotation = parse_rotation(&request.rotation)?;
-    let canonical_path =
-        canonical_image_path(&request, &rect, &info, out_width, out_height, rotation);
+    let canonical_path = canonical_image_path(
+        &request,
+        &rect,
+        info.width,
+        info.height,
+        out_width,
+        out_height,
+        rotation,
+    );
 
     if !matches!(
         request.quality.as_str(),
@@ -647,16 +697,22 @@ fn render_iiif_image(
     };
 
     let render_start = Instant::now();
-    let preview = render_preview(
-        &image_path,
-        &info,
-        rect,
-        out_width.max(out_height),
-        state.max_chunk_mb,
-        state.backend,
-        None,
-        None,
-    )?;
+    let preview = match &info.source {
+        ServerImageSource::Tiff(tiff_info) => render_preview(
+            &image_path,
+            tiff_info,
+            rect,
+            out_width.max(out_height),
+            state.max_chunk_mb,
+            state.backend,
+            None,
+            None,
+        )?,
+        #[cfg(feature = "jpeg2000-grok")]
+        ServerImageSource::Jpeg2000(_) => {
+            render_jpeg2000_grok_preview(&image_path, rect, out_width, out_height)?
+        }
+    };
     timing.render = render_start.elapsed();
     let mut rgba = if preview.width == out_width && preview.height == out_height {
         preview.rgba
@@ -705,7 +761,7 @@ fn render_iiif_image(
 fn response_cache_path(
     cache_dir: &Path,
     image_path: &Path,
-    info: &ImageInfo,
+    info: &ServerImageInfo,
     canonical_path: &str,
     out_width: u32,
     out_height: u32,
@@ -729,8 +785,18 @@ fn response_cache_path(
     hash.write_u64(modified.subsec_nanos() as u64);
     hash.write_u64(info.width as u64);
     hash.write_u64(info.height as u64);
-    hash.write_u64(info.chunk_width as u64);
-    hash.write_u64(info.chunk_height as u64);
+    hash.write_bytes(info.source_label().as_bytes());
+    match &info.source {
+        ServerImageSource::Tiff(tiff_info) => {
+            hash.write_u64(tiff_info.chunk_width as u64);
+            hash.write_u64(tiff_info.chunk_height as u64);
+        }
+        #[cfg(feature = "jpeg2000-grok")]
+        ServerImageSource::Jpeg2000(jpeg2000_info) => {
+            hash.write_u64(jpeg2000_info.components.unwrap_or_default() as u64);
+            hash.write_u64(jpeg2000_info.precision.unwrap_or_default() as u64);
+        }
+    }
     hash.write_u64(out_width as u64);
     hash.write_u64(out_height as u64);
     hash.write_bytes(canonical_path.as_bytes());
@@ -1057,7 +1123,8 @@ fn parse_format(format: &str) -> Result<ImageFormat> {
 fn canonical_image_path(
     request: &IiifImageRequest,
     rect: &Rect,
-    info: &ImageInfo,
+    image_width: u32,
+    image_height: u32,
     out_width: u32,
     out_height: u32,
     rotation: IiifRotation,
@@ -1065,7 +1132,7 @@ fn canonical_image_path(
     format!(
         "/iiif/3/{}/{}/{}/{}/{}.{}",
         encode_id(&request.id),
-        canonical_region(rect, info),
+        canonical_region(rect, image_width, image_height),
         canonical_size(&request.size, out_width, out_height),
         canonical_rotation(rotation),
         request.quality,
@@ -1073,8 +1140,8 @@ fn canonical_image_path(
     )
 }
 
-fn canonical_region(rect: &Rect, info: &ImageInfo) -> String {
-    if rect.x == 0 && rect.y == 0 && rect.width == info.width && rect.height == info.height {
+fn canonical_region(rect: &Rect, image_width: u32, image_height: u32) -> String {
+    if rect.x == 0 && rect.y == 0 && rect.width == image_width && rect.height == image_height {
         "full".to_string()
     } else {
         format!("{},{},{},{}", rect.x, rect.y, rect.width, rect.height)
@@ -1136,21 +1203,21 @@ fn stale_cache_prune_instant() -> Instant {
     now.checked_sub(Duration::from_secs(3600)).unwrap_or(now)
 }
 
-fn parse_region(region: &str, info: &ImageInfo) -> Result<Rect> {
+fn parse_region(region: &str, image_width: u32, image_height: u32) -> Result<Rect> {
     if region == "full" || region == "max" {
         return Ok(Rect {
             x: 0,
             y: 0,
-            width: info.width,
-            height: info.height,
+            width: image_width,
+            height: image_height,
         });
     }
 
     if region == "square" {
-        let side = info.width.min(info.height);
+        let side = image_width.min(image_height);
         return Ok(Rect {
-            x: (info.width - side) / 2,
-            y: (info.height - side) / 2,
+            x: (image_width - side) / 2,
+            y: (image_height - side) / 2,
             width: side,
             height: side,
         });
@@ -1158,14 +1225,14 @@ fn parse_region(region: &str, info: &ImageInfo) -> Result<Rect> {
 
     if let Some(percent_region) = region.strip_prefix("pct:") {
         let parts = parse_percentage_parts(percent_region, 4, "region")?;
-        let x = percent_to_u32(parts[0], info.width, false);
-        let y = percent_to_u32(parts[1], info.height, false);
-        let width = percent_to_u32(parts[2], info.width, true);
-        let height = percent_to_u32(parts[3], info.height, true);
+        let x = percent_to_u32(parts[0], image_width, false);
+        let y = percent_to_u32(parts[1], image_height, false);
+        let width = percent_to_u32(parts[2], image_width, true);
+        let height = percent_to_u32(parts[3], image_height, true);
         if width == 0 || height == 0 {
             bail!("pct region width and height must be greater than zero");
         }
-        return clamp_rect(x, y, width, height, info.width, info.height);
+        return clamp_rect(x, y, width, height, image_width, image_height);
     }
 
     let parts: Vec<u32> = region
@@ -1181,8 +1248,8 @@ fn parse_region(region: &str, info: &ImageInfo) -> Result<Rect> {
         parts[1],
         parts[2],
         parts[3],
-        info.width,
-        info.height,
+        image_width,
+        image_height,
     )
 }
 
@@ -1539,7 +1606,319 @@ fn resize_nearest_rgba(
     resized
 }
 
-async fn load_cached_info(state: &AppState, path: &Path) -> Result<Arc<ImageInfo>> {
+#[cfg(feature = "jpeg2000-grok")]
+fn load_jpeg2000_info(path: &Path) -> Result<ServerImageInfo> {
+    let output = Command::new(grok_dump_command())
+        .arg("-i")
+        .arg(path)
+        .output()
+        .with_context(|| "running grk_dump for JPEG2000 metadata")?;
+
+    if !output.status.success() {
+        bail!(
+            "grk_dump failed for {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    let mut dump = String::from_utf8_lossy(&output.stdout).to_string();
+    if !output.stderr.is_empty() {
+        dump.push('\n');
+        dump.push_str(&String::from_utf8_lossy(&output.stderr));
+    }
+
+    let info = parse_grok_dump_info(&dump)?;
+    Ok(ServerImageInfo {
+        width: info.width,
+        height: info.height,
+        source: ServerImageSource::Jpeg2000(info.jpeg2000),
+    })
+}
+
+#[cfg(feature = "jpeg2000-grok")]
+fn render_jpeg2000_grok_preview(
+    path: &Path,
+    rect: Rect,
+    out_width: u32,
+    out_height: u32,
+) -> Result<PreviewBitmap> {
+    let total_start = Instant::now();
+    let temp_path = std::env::temp_dir().join(format!(
+        "gigatiff-grok-{}-{}.ppm",
+        std::process::id(),
+        UNIX_EPOCH.elapsed().unwrap_or_default().as_nanos()
+    ));
+
+    let mut command = Command::new(grok_decompress_command());
+    command
+        .arg("-i")
+        .arg(path)
+        .arg("-o")
+        .arg(&temp_path)
+        .arg("-d")
+        .arg(format!(
+            "{},{},{},{}",
+            rect.x,
+            rect.y,
+            rect.x.saturating_add(rect.width),
+            rect.y.saturating_add(rect.height)
+        ))
+        .arg("-f");
+
+    let reduce = grok_reduce_factor(rect, out_width, out_height);
+    if reduce > 0 {
+        command.arg("-r").arg(reduce.to_string());
+    }
+
+    let decode_start = Instant::now();
+    let output = command
+        .output()
+        .with_context(|| "running grk_decompress for JPEG2000 region")?;
+    let decode = decode_start.elapsed();
+
+    if !output.status.success() {
+        let _ = fs::remove_file(&temp_path);
+        bail!(
+            "grk_decompress failed for {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    let read_start = Instant::now();
+    let bytes = fs::read(&temp_path)
+        .with_context(|| format!("reading Grok output {}", temp_path.display()))?;
+    let _ = fs::remove_file(&temp_path);
+    let (decoded_width, decoded_height, rgba) = parse_pnm_rgba(&bytes)?;
+    let read = read_start.elapsed();
+
+    let convert_start = Instant::now();
+    let rgba = if decoded_width == out_width && decoded_height == out_height {
+        rgba
+    } else {
+        resize_nearest_rgba(&rgba, decoded_width, decoded_height, out_width, out_height)
+    };
+    let convert = convert_start.elapsed();
+
+    Ok(PreviewBitmap {
+        width: out_width,
+        height: out_height,
+        rgba,
+        source: "grok-jpeg2000",
+        decoded_chunks: 1,
+        stats: RenderStats {
+            total: total_start.elapsed(),
+            read,
+            convert,
+            decode,
+            ..RenderStats::default()
+        },
+    })
+}
+
+#[cfg(feature = "jpeg2000-grok")]
+fn grok_reduce_factor(rect: Rect, out_width: u32, out_height: u32) -> u32 {
+    let width_scale = rect.width.max(1) / out_width.max(1);
+    let height_scale = rect.height.max(1) / out_height.max(1);
+    let mut scale = width_scale.min(height_scale);
+    let mut reduce = 0;
+    while scale >= 2 && reduce < 8 {
+        reduce += 1;
+        scale /= 2;
+    }
+    reduce
+}
+
+#[cfg(feature = "jpeg2000-grok")]
+#[derive(Debug, Clone, Copy)]
+struct ParsedGrokInfo {
+    width: u32,
+    height: u32,
+    jpeg2000: Jpeg2000Info,
+}
+
+#[cfg(feature = "jpeg2000-grok")]
+fn parse_grok_dump_info(text: &str) -> Result<ParsedGrokInfo> {
+    let fields = grok_numeric_fields(text);
+    let x0 = field_value(&fields, &["x0"]).unwrap_or(0);
+    let y0 = field_value(&fields, &["y0"]).unwrap_or(0);
+    let x1 = field_value(&fields, &["x1"]);
+    let y1 = field_value(&fields, &["y1"]);
+    let width = x1
+        .and_then(|x1| x1.checked_sub(x0))
+        .or_else(|| field_value(&fields, &["width"]));
+    let height = y1
+        .and_then(|y1| y1.checked_sub(y0))
+        .or_else(|| field_value(&fields, &["height"]));
+    let width = width
+        .filter(|value| *value > 0)
+        .ok_or_else(|| anyhow!("could not parse JPEG2000 width from grk_dump output"))?;
+    let height = height
+        .filter(|value| *value > 0)
+        .ok_or_else(|| anyhow!("could not parse JPEG2000 height from grk_dump output"))?;
+
+    Ok(ParsedGrokInfo {
+        width,
+        height,
+        jpeg2000: Jpeg2000Info {
+            components: field_value(&fields, &["numcomps", "components", "num_components"]),
+            precision: field_value(&fields, &["prec", "precision", "bpp"]),
+        },
+    })
+}
+
+#[cfg(feature = "jpeg2000-grok")]
+fn grok_numeric_fields(text: &str) -> HashMap<String, u32> {
+    let mut fields = HashMap::new();
+    for line in text.lines() {
+        let tokens = grok_line_tokens(line);
+        for pair in tokens.windows(2) {
+            if let Ok(value) = pair[1].parse::<u32>() {
+                fields.entry(pair[0].clone()).or_insert(value);
+            }
+        }
+    }
+    fields
+}
+
+#[cfg(feature = "jpeg2000-grok")]
+fn grok_line_tokens(line: &str) -> Vec<String> {
+    line.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                ch.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
+}
+
+#[cfg(feature = "jpeg2000-grok")]
+fn field_value(fields: &HashMap<String, u32>, names: &[&str]) -> Option<u32> {
+    names.iter().find_map(|name| fields.get(*name).copied())
+}
+
+#[cfg(feature = "jpeg2000-grok")]
+fn parse_pnm_rgba(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
+    let mut cursor = PnmCursor { bytes, pos: 0 };
+    let magic = cursor.next_token()?;
+    let samples_per_pixel = match magic.as_slice() {
+        b"P5" => 1usize,
+        b"P6" => 3usize,
+        _ => bail!("unsupported Grok PNM output format"),
+    };
+    let width = parse_ascii_u32(&cursor.next_token()?, "PNM width")?;
+    let height = parse_ascii_u32(&cursor.next_token()?, "PNM height")?;
+    let max_value = parse_ascii_u32(&cursor.next_token()?, "PNM max value")?;
+    if width == 0 || height == 0 || max_value == 0 {
+        bail!("invalid PNM dimensions or max value");
+    }
+
+    cursor.consume_raster_separator()?;
+    let bytes_per_sample = if max_value <= 255 { 1usize } else { 2usize };
+    let sample_count = width as usize * height as usize * samples_per_pixel;
+    let expected_len = sample_count
+        .checked_mul(bytes_per_sample)
+        .ok_or_else(|| anyhow!("PNM raster is too large"))?;
+    if cursor.bytes.len().saturating_sub(cursor.pos) < expected_len {
+        bail!("truncated PNM raster");
+    }
+
+    let raster = &cursor.bytes[cursor.pos..cursor.pos + expected_len];
+    let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
+    for pixel in 0..(width as usize * height as usize) {
+        let sample_at = |sample: usize| -> u8 {
+            let index = (pixel * samples_per_pixel + sample) * bytes_per_sample;
+            let value = if bytes_per_sample == 1 {
+                raster[index] as u32
+            } else {
+                u16::from_be_bytes([raster[index], raster[index + 1]]) as u32
+            };
+            ((value * 255) / max_value).min(255) as u8
+        };
+
+        if samples_per_pixel == 1 {
+            let gray = sample_at(0);
+            rgba.extend_from_slice(&[gray, gray, gray, 255]);
+        } else {
+            rgba.extend_from_slice(&[sample_at(0), sample_at(1), sample_at(2), 255]);
+        }
+    }
+
+    Ok((width, height, rgba))
+}
+
+#[cfg(feature = "jpeg2000-grok")]
+struct PnmCursor<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+#[cfg(feature = "jpeg2000-grok")]
+impl<'a> PnmCursor<'a> {
+    fn next_token(&mut self) -> Result<Vec<u8>> {
+        self.skip_whitespace_and_comments();
+        let start = self.pos;
+        while self.pos < self.bytes.len() && !self.bytes[self.pos].is_ascii_whitespace() {
+            if self.bytes[self.pos] == b'#' {
+                break;
+            }
+            self.pos += 1;
+        }
+        if self.pos == start {
+            bail!("missing PNM token");
+        }
+        Ok(self.bytes[start..self.pos].to_vec())
+    }
+
+    fn skip_whitespace_and_comments(&mut self) {
+        loop {
+            while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_whitespace() {
+                self.pos += 1;
+            }
+            if self.pos < self.bytes.len() && self.bytes[self.pos] == b'#' {
+                while self.pos < self.bytes.len() && self.bytes[self.pos] != b'\n' {
+                    self.pos += 1;
+                }
+                continue;
+            }
+            break;
+        }
+    }
+
+    fn consume_raster_separator(&mut self) -> Result<()> {
+        if self.pos >= self.bytes.len() || !self.bytes[self.pos].is_ascii_whitespace() {
+            bail!("missing PNM raster separator");
+        }
+        self.pos += 1;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "jpeg2000-grok")]
+fn parse_ascii_u32(bytes: &[u8], label: &str) -> Result<u32> {
+    let value = std::str::from_utf8(bytes).with_context(|| format!("invalid {label}"))?;
+    value
+        .parse()
+        .with_context(|| format!("invalid {label} '{value}'"))
+}
+
+#[cfg(feature = "jpeg2000-grok")]
+fn grok_dump_command() -> OsString {
+    std::env::var_os("GIGATIFF_GROK_DUMP").unwrap_or_else(|| OsString::from("grk_dump"))
+}
+
+#[cfg(feature = "jpeg2000-grok")]
+fn grok_decompress_command() -> OsString {
+    std::env::var_os("GIGATIFF_GROK_DECOMPRESS").unwrap_or_else(|| OsString::from("grk_decompress"))
+}
+
+async fn load_cached_info(state: &AppState, path: &Path) -> Result<Arc<ServerImageInfo>> {
     let state = state.clone();
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || load_cached_info_blocking(&state, &path))
@@ -1547,7 +1926,7 @@ async fn load_cached_info(state: &AppState, path: &Path) -> Result<Arc<ImageInfo
         .map_err(|err| anyhow!("info task failed: {err}"))?
 }
 
-fn load_cached_info_blocking(state: &AppState, path: &Path) -> Result<Arc<ImageInfo>> {
+fn load_cached_info_blocking(state: &AppState, path: &Path) -> Result<Arc<ServerImageInfo>> {
     if let Some(info) = state
         .info_cache
         .lock()
@@ -1558,13 +1937,32 @@ fn load_cached_info_blocking(state: &AppState, path: &Path) -> Result<Arc<ImageI
         return Ok(info);
     }
 
-    let info = Arc::new(load_info(path)?);
+    let info = Arc::new(load_server_image_info(path)?);
     state
         .info_cache
         .lock()
         .map_err(|_| anyhow!("info cache lock poisoned"))?
         .insert(path.to_path_buf(), Arc::clone(&info));
     Ok(info)
+}
+
+fn load_server_image_info(path: &Path) -> Result<ServerImageInfo> {
+    if is_tiff_path(path) {
+        return Ok(ServerImageInfo::from_tiff(load_info(path)?));
+    }
+
+    if is_jpeg2000_path(path) {
+        #[cfg(feature = "jpeg2000-grok")]
+        {
+            return load_jpeg2000_info(path);
+        }
+        #[cfg(not(feature = "jpeg2000-grok"))]
+        {
+            bail!("JPEG2000 support requires the jpeg2000-grok Cargo feature");
+        }
+    }
+
+    bail!("unsupported image format");
 }
 
 fn collect_images(root: &Path) -> Result<Vec<ImageListItem>> {
@@ -1582,7 +1980,7 @@ fn collect_images_inner(root: &Path, dir: &Path, images: &mut Vec<ImageListItem>
             collect_images_inner(root, &path, images)?;
             continue;
         }
-        if !is_tiff_path(&path) {
+        if !is_supported_image_path(&path) {
             continue;
         }
         let id = relative_id(root, &path)?;
@@ -1616,8 +2014,8 @@ fn resolve_id(root: &Path, id: &str) -> Result<PathBuf> {
     }
 
     let path = root.join(relative);
-    if !is_tiff_path(&path) {
-        bail!("identifier does not point to a TIFF file");
+    if !is_supported_image_path(&path) {
+        bail!("identifier does not point to a supported image file");
     }
     if !path.exists() {
         bail!("image not found");
@@ -1705,6 +2103,22 @@ fn is_tiff_path(path: &Path) -> bool {
         .and_then(|ext| ext.to_str())
         .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "tif" | "tiff"))
         .unwrap_or(false)
+}
+
+fn is_jpeg2000_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "jp2" | "j2k" | "j2c" | "jpc"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn is_supported_image_path(path: &Path) -> bool {
+    is_tiff_path(path) || is_jpeg2000_path(path)
 }
 
 fn error_response(status: StatusCode, err: anyhow::Error) -> Response {
@@ -1802,12 +2216,20 @@ mod tests {
             quality: "default".to_string(),
             format: ImageFormat::Jpeg,
         };
-        let rect = parse_region(&request.region, &info).unwrap();
+        let rect = parse_region(&request.region, info.width, info.height).unwrap();
         let (out_width, out_height) = parse_size(&request.size, rect, 16_777_216).unwrap();
         let rotation = parse_rotation(&request.rotation).unwrap();
 
         assert_eq!(
-            canonical_image_path(&request, &rect, &info, out_width, out_height, rotation),
+            canonical_image_path(
+                &request,
+                &rect,
+                info.width,
+                info.height,
+                out_width,
+                out_height,
+                rotation
+            ),
             "/iiif/3/folder%2Fmap.tif/1024,512,2048,1024/1024,512/!90/default.jpg"
         );
     }
@@ -1914,7 +2336,7 @@ mod tests {
         let info = dummy_info();
 
         assert_eq!(
-            parse_region("square", &info).unwrap(),
+            parse_region("square", info.width, info.height).unwrap(),
             Rect {
                 x: 1024,
                 y: 0,
@@ -1923,7 +2345,7 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_region("pct:25,25,50,50", &info).unwrap(),
+            parse_region("pct:25,25,50,50", info.width, info.height).unwrap(),
             Rect {
                 x: 1024,
                 y: 512,
@@ -1932,7 +2354,7 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_region("pct:0,0,100,100", &info).unwrap(),
+            parse_region("pct:0,0,100,100", info.width, info.height).unwrap(),
             Rect {
                 x: 0,
                 y: 0,
@@ -1947,7 +2369,7 @@ mod tests {
         let info = dummy_info();
 
         assert_eq!(
-            parse_region("4000,2000,500,500", &info).unwrap(),
+            parse_region("4000,2000,500,500", info.width, info.height).unwrap(),
             Rect {
                 x: 4000,
                 y: 2000,
@@ -1955,11 +2377,11 @@ mod tests {
                 height: 48,
             }
         );
-        assert!(parse_region("4096,0,1,1", &info).is_err());
-        assert!(parse_region("0,2048,1,1", &info).is_err());
-        assert!(parse_region("0,0,0,1", &info).is_err());
-        assert!(parse_region("pct:100,0,10,10", &info).is_err());
-        assert!(parse_region("pct:0,0,0,10", &info).is_err());
+        assert!(parse_region("4096,0,1,1", info.width, info.height).is_err());
+        assert!(parse_region("0,2048,1,1", info.width, info.height).is_err());
+        assert!(parse_region("0,0,0,1", info.width, info.height).is_err());
+        assert!(parse_region("pct:100,0,10,10", info.width, info.height).is_err());
+        assert!(parse_region("pct:0,0,0,10", info.width, info.height).is_err());
     }
 
     #[test]
@@ -2062,7 +2484,7 @@ mod tests {
         let image_path = temp.join("map.tif");
         fs::write(&image_path, b"dummy").unwrap();
         let state = dummy_state(temp.join("cache"));
-        let info = dummy_info();
+        let info = ServerImageInfo::from_tiff(dummy_info());
 
         let full = IiifImageRequest {
             id: "map.tif".to_string(),
@@ -2077,23 +2499,26 @@ mod tests {
             size: "full".to_string(),
             ..full.clone()
         };
-        let full_rect = parse_region(&full.region, &info).unwrap();
+        let full_rect = parse_region(&full.region, info.width, info.height).unwrap();
         let (full_width, full_height) = parse_size(&full.size, full_rect, 16_777_216).unwrap();
         let full_canonical = canonical_image_path(
             &full,
             &full_rect,
-            &info,
+            info.width,
+            info.height,
             full_width,
             full_height,
             parse_rotation(&full.rotation).unwrap(),
         );
-        let equivalent_rect = parse_region(&pixel_equivalent.region, &info).unwrap();
+        let equivalent_rect =
+            parse_region(&pixel_equivalent.region, info.width, info.height).unwrap();
         let (equivalent_width, equivalent_height) =
             parse_size(&pixel_equivalent.size, equivalent_rect, 16_777_216).unwrap();
         let equivalent_canonical = canonical_image_path(
             &pixel_equivalent,
             &equivalent_rect,
-            &info,
+            info.width,
+            info.height,
             equivalent_width,
             equivalent_height,
             parse_rotation(&pixel_equivalent.rotation).unwrap(),
@@ -2126,13 +2551,14 @@ mod tests {
             size: "1024,".to_string(),
             ..full
         };
-        let changed_rect = parse_region(&changed.region, &info).unwrap();
+        let changed_rect = parse_region(&changed.region, info.width, info.height).unwrap();
         let (changed_width, changed_height) =
             parse_size(&changed.size, changed_rect, 16_777_216).unwrap();
         let changed_canonical = canonical_image_path(
             &changed,
             &changed_rect,
-            &info,
+            info.width,
+            info.height,
             changed_width,
             changed_height,
             parse_rotation(&changed.rotation).unwrap(),
@@ -2196,6 +2622,48 @@ mod tests {
         assert_eq!(purged.last_prune.removed_files, 2);
         assert_eq!(purged.last_prune.removed_bytes, 10);
         let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn supported_image_paths_include_tiff_and_jpeg2000() {
+        assert!(is_supported_image_path(Path::new("map.tif")));
+        assert!(is_supported_image_path(Path::new("map.TIFF")));
+        assert!(is_supported_image_path(Path::new("scan.jp2")));
+        assert!(is_supported_image_path(Path::new("scan.j2k")));
+        assert!(!is_supported_image_path(Path::new("scan.png")));
+    }
+
+    #[cfg(feature = "jpeg2000-grok")]
+    #[test]
+    fn parses_grok_dump_metadata() {
+        let dump = r#"
+            image {
+              x0=0, y0=0, x1=4096, y1=2048
+              numcomps=3
+            }
+            comp 0: prec=12
+        "#;
+
+        let info = parse_grok_dump_info(dump).unwrap();
+
+        assert_eq!(info.width, 4096);
+        assert_eq!(info.height, 2048);
+        assert_eq!(info.jpeg2000.components, Some(3));
+        assert_eq!(info.jpeg2000.precision, Some(12));
+    }
+
+    #[cfg(feature = "jpeg2000-grok")]
+    #[test]
+    fn parses_pnm_rgb_and_grayscale_to_rgba() {
+        let rgb = b"P6\n2 1\n255\n\xff\x00\x00\x00\x80\xff";
+        let (width, height, rgba) = parse_pnm_rgba(rgb).unwrap();
+        assert_eq!((width, height), (2, 1));
+        assert_eq!(rgba, vec![255, 0, 0, 255, 0, 128, 255, 255]);
+
+        let gray_16 = b"P5\n1 1\n65535\n\x80\x00";
+        let (width, height, rgba) = parse_pnm_rgba(gray_16).unwrap();
+        assert_eq!((width, height), (1, 1));
+        assert_eq!(rgba, vec![127, 127, 127, 255]);
     }
 
     fn dummy_state(cache_dir: PathBuf) -> AppState {

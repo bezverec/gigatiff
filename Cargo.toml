@@ -15,6 +15,7 @@ server = [
     "dep:tokio",
     "dep:tower-http",
 ]
+jpeg2000-grok = ["server"]
 
 [dependencies]
 anyhow = "1.0.102"

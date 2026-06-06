@@ -7,7 +7,7 @@ The project has two application surfaces:
 - a cross-platform desktop viewer, exposed as `gigatiff`, with GUI, metadata, and PNG preview/export commands,
 - a Linux/container-targeted IIIF-compatible image server, exposed as `gigatiff-server`, for browser-based viewing.
 
-The default pixel backend is `auto`: it prefers direct raw-strip reads for suitable uncompressed
+The default desktop/TIFF pixel backend is `auto`: it prefers direct raw-strip reads for suitable uncompressed
 stripped TIFFs and falls back to `libtiff` scanlines for broader TIFF support. A pure Rust TIFF path
 is still available as a CLI fallback for supported files.
 
@@ -146,19 +146,35 @@ target\debug\gigatiff.exe preview mapa2.tif --backend libtiff --x 0 --y 0 --widt
 
 The server side is intentionally separate from the desktop viewer. It targets Linux deployment,
 primarily through Docker or Podman, and is not part of the cross-platform desktop release archives. It
-reuses the same TIFF rendering pipeline, but exposes it through HTTP, IIIF-style image URLs, and a
+reuses the same TIFF rendering pipeline for TIFF/BigTIFF sources and can optionally use Grok command
+line tools for JPEG2000 sources. Both paths are exposed through HTTP, IIIF-style image URLs, and a
 browser viewer.
 
 ### Running the Image Server
 
-`gigatiff-server` is a separate binary so the desktop viewer remains standalone. It exposes TIFF files
-under a root directory through a small IIIF Image API 3.0-compatible surface and includes a minimal
-OpenSeadragon viewer.
+`gigatiff-server` is a separate binary so the desktop viewer remains standalone. It exposes image
+files under a root directory through a small IIIF Image API 3.0-compatible surface and includes a
+minimal OpenSeadragon viewer.
 
 ```bash
 cargo build --release --bin gigatiff-server --no-default-features --features server
 target/release/gigatiff-server --root /path/to/tiffs --addr 127.0.0.1:8080
 ```
+
+Supported source files in the base server feature are `.tif` and `.tiff`. JPEG2000 support is
+available through the optional `jpeg2000-grok` feature, which shells out to Grok tools:
+
+```bash
+cargo build --release --bin gigatiff-server --no-default-features --features server,jpeg2000-grok
+target/release/gigatiff-server --root /path/to/images --addr 127.0.0.1:8080
+```
+
+With `jpeg2000-grok`, `.jp2`, `.j2k`, `.j2c`, and `.jpc` files are listed and served. Metadata is
+read with `grk_dump`; region rendering uses `grk_decompress` with the requested IIIF region and an
+appropriate decode reduction. The command paths can be overridden with `GIGATIFF_GROK_DUMP` and
+`GIGATIFF_GROK_DECOMPRESS`. The Docker image enables this feature and installs Grok tools. Native
+non-container Linux deployments need `grokj2k-tools` installed. Grok is AGPL-licensed, so this backend
+is kept server-only and optional in Cargo builds.
 
 The server stores encoded IIIF region/tile responses in a persistent cache. By default this is
 `cache/server`; it can be changed with `--cache-dir`. Cached files are keyed by source path, file
@@ -205,15 +221,18 @@ and canonical image URI. WebP is currently encoded losslessly by the Rust `image
 `--quality` and PNG uses fast compression. See `IIIF_COMPLIANCE.md` for the detailed feature matrix.
 
 Server-only builds avoid the desktop GUI dependencies and are the expected native build mode on
-Linux:
+Linux. Use the base command for TIFF-only deployments:
 
 ```bash
 cargo build --release --bin gigatiff-server --no-default-features --features server
 ```
 
+Use `server,jpeg2000-grok` for TIFF plus JPEG2000 deployments.
+
 ### Docker and Caddy
 
-The Docker image builds only the server feature and expects image files mounted at `/data`:
+The Docker image builds only the server feature plus the Grok JPEG2000 backend and expects image files
+mounted at `/data`:
 
 ```bash
 docker build -t gigatiff-server .
@@ -365,6 +384,9 @@ dependencies are behind the `server` feature. The default build enables only `de
 desktop app on Windows, Linux, and macOS, and checks the server path on Linux through a server-only
 build plus Docker-based IIIF smoke test.
 
+The `jpeg2000-grok` Cargo feature does not add Rust crate dependencies; it enables the server-side
+Grok command backend and requires `grk_dump` and `grk_decompress` at runtime.
+
 ## Color Management
 
 The reader loads an embedded ICC profile from the TIFF `IccProfile` tag when present.
@@ -426,9 +448,14 @@ important than squeezing out the smallest possible PNG. CLI exports can choose `
 
 ### Server Rendering
 
-The server reuses the shared viewport renderer, then encodes the result as PNG, JPEG, or WebP for
-IIIF image responses. It keeps a persistent encoded response cache on disk, so repeated tile/region
-requests can skip TIFF reads, sampling, color conversion, and image encoding.
+For TIFF/BigTIFF sources, the server reuses the shared viewport renderer, then encodes the result as
+PNG, JPEG, or WebP for IIIF image responses. It keeps a persistent encoded response cache on disk, so
+repeated tile/region requests can skip TIFF reads, sampling, color conversion, and image encoding.
+
+For JPEG2000 sources, the optional Grok backend decodes only the requested IIIF region through
+`grk_decompress` and chooses a JPEG2000 reduction level when the requested output is substantially
+smaller than the source region. The server then applies the same IIIF geometry, quality conversion,
+encoding, and persistent response cache used by TIFF responses.
 
 ## Benchmarks
 
@@ -493,6 +520,25 @@ table includes `RegionSize` and `OutputSize` columns so rendering cost, encoding
 and cache behavior can be compared across IIIF request shapes. The helper also records server timing
 averages for render, encode, cache read, cache store, and cache prune phases when those headers are
 present.
+
+Recent TIFF/JPEG2000 server comparison through the same Docker Compose stack used JPEG output, two
+source region sizes, and 512 px output. Each cold value below is the average of three cache-purged
+requests and reports the server-side render phase, excluding JPEG encoding and cache storage:
+
+```text
+source                         1024 -> 512  4096 -> 512
+mapa2_no_xmp_clean.tif             42.5 ms      50.1 ms
+mapa2.tif                          85.9 ms     105.7 ms
+mapa2_no_xmp_clean_master.jp2      21.6 ms      20.1 ms
+mapa2_no_xmp_clean_user_1_8.jp2    40.3 ms     124.1 ms
+mapa2_master.jp2                   30.2 ms      30.2 ms
+mapa2_user_1_8.jp2                 49.9 ms     150.8 ms
+```
+
+The JP2 fixtures were generated from the local TIFF samples with Grok. Master copies used 4096 x
+4096 tiles, RPCL progression, six resolutions, and `-H 1`; user copies used the 1:8 rate list,
+irreversible transform, 1024 x 1024 tiles, and `-H 1`. The thread limit was required for reliable
+conversion of the multi-gigabyte TIFF inputs in Docker.
 
 Small WebP tile-size smoke run after the `pct:` IIIF update
 (`-ImageIds mapa2_no_xmp_clean.tif -Formats webp -OutputSizes 128,256 -Iterations 2 -Parallel 2 -ClearCache`):

@@ -4,6 +4,7 @@ FROM rust:1-bookworm AS build
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    grokj2k-tools \
     liblcms2-dev \
     libtiff-dev \
     pkg-config \
@@ -11,12 +12,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 COPY . .
-RUN cargo build --release --locked --bin gigatiff-server --no-default-features --features server
+RUN cargo build --release --locked --bin gigatiff-server --no-default-features --features server,jpeg2000-grok
 
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    grokj2k-tools \
     liblcms2-2 \
     libtiff6 \
   && rm -rf /var/lib/apt/lists/*
