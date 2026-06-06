@@ -165,7 +165,10 @@ try {
         Assert-True ([int]$size.height -le [int]$info.height) "info.json sizes should not exceed full height"
         Assert-True (([int64]$size.width * [int64]$size.height) -le [int64]$info.maxArea) "info.json sizes should respect maxArea"
     }
-    Assert-True (@($sizes | Where-Object { [int]$_.width -eq [int]$info.width -and [int]$_.height -eq [int]$info.height }).Count -gt 0) "info.json sizes should include full dimensions when within maxArea"
+    $fullArea = [int64]$info.width * [int64]$info.height
+    if ($fullArea -le [int64]$info.maxArea) {
+        Assert-True (@($sizes | Where-Object { [int]$_.width -eq [int]$info.width -and [int]$_.height -eq [int]$info.height }).Count -gt 0) "info.json sizes should include full dimensions when within maxArea"
+    }
     Assert-True ($tiles.Count -gt 0) "info.json should advertise tiles"
     Assert-True (@($tiles[0].scaleFactors).Count -gt 0) "info.json tiles should advertise scale factors"
     $results.Add((Add-Result "info.json" "pass" "profile=$profile")) | Out-Null
