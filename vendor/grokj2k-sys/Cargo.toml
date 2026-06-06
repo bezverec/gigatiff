@@ -1,0 +1,18 @@
+[package]
+name = "grokj2k-sys"
+version = "1.0.0"
+edition = "2021"
+links = "grokj2k"
+license = "AGPL-3.0-only"
+description = "Generated bindings for the Grok JPEG 2000 SDK"
+
+[dependencies]
+libc = "0.2"
+
+[build-dependencies]
+bindgen = "0.72"
+pkg-config = "0.3"
+
+[lib]
+name = "grokj2k_sys"
+path = "src/lib.rs"

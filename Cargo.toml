@@ -16,12 +16,14 @@ server = [
     "dep:tower-http",
 ]
 jpeg2000-grok = ["server"]
+jpeg2000-grok-ffi = ["jpeg2000-grok", "dep:grokj2k-sys"]
 
 [dependencies]
 anyhow = "1.0.102"
 axum = { version = "0.8.9", optional = true }
 clap = { version = "4.6.1", features = ["derive"] }
 eframe = { version = "0.34.3", optional = true }
+grokj2k-sys = { path = "vendor/grokj2k-sys", optional = true }
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"], optional = true }
 lcms2 = "6.1.1"
 percent-encoding = { version = "2.3.2", optional = true }

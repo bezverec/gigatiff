@@ -561,22 +561,71 @@ and cache behavior can be compared across IIIF request shapes. The helper also r
 averages for render, encode, cache read, cache store, and cache prune phases when those headers are
 present.
 
-Recent TIFF/JPEG2000 server comparison through the same Docker Compose stack used JPEG output, two
-source region sizes, and 512 px output. Each cold value below is the average of three cache-purged
-requests and reports the server-side render phase, excluding JPEG encoding and cache storage:
+Recent TIFF/JPEG2000 server comparison used JPEG output, two source region sizes, and 512 px
+output. Each value below reports the average server-side render phase after purging the persistent
+response cache before each request. Render time excludes JPEG encoding and cache storage.
+
+The current TIFF values are from the Grok FFI Docker image, but the TIFF path is identical between
+the FFI and CLI server builds. A second alternated-order run confirmed that the TIFF differences
+between those two images are measurement noise and operating-system page cache effects, not a code
+path difference:
 
 ```text
-source                         1024 -> 512  4096 -> 512
-mapa2_no_xmp_clean.tif             42.5 ms      50.1 ms
-mapa2.tif                          85.9 ms     105.7 ms
-mapa2_no_xmp_clean_master.jp2      21.6 ms      20.1 ms
-mapa2_no_xmp_clean_user_1_8.jp2    40.3 ms     124.1 ms
-mapa2_master.jp2                   30.2 ms      30.2 ms
-mapa2_user_1_8.jp2                 49.9 ms     150.8 ms
+source                         previous     current FFI
+                               1024  4096   1024  4096
+mapa2_no_xmp_clean.tif         42.5  50.1   39.9  44.5 ms
+mapa2.tif                      85.9 105.7   81.2 103.0 ms
+```
+
+For JPEG2000 region requests, the new FFI path improves the master-copy cases and keeps all results
+competitive with the previous documented Grok CLI baseline. The lower-rate user-copy files are more
+mixed: compared with the current CLI build, FFI is slower for small region requests, although still
+substantially better than the previous documented 4096 px user-copy results.
+
+```text
+source                         previous     current FFI
+                               1024  4096   1024  4096
+mapa2_no_xmp_clean_master.jp2  21.6  20.1    6.3   7.4 ms
+mapa2_no_xmp_clean_user_1_8.jp2
+                               40.3 124.1   35.2  54.6 ms
+mapa2_master.jp2               30.2  30.2   15.2  18.8 ms
+mapa2_user_1_8.jp2             49.9 150.8   55.2  72.1 ms
+```
+
+The direct FFI-vs-CLI comparison below was run from two Docker images built from the same source
+tree. Both used upstream Grok `v20.3.3`; requests were alternated between backends to reduce OS page
+cache bias. Values are average render phase in milliseconds over five cache-purged requests.
+
+```text
+source                         CLI   FFI    CLI   FFI
+                               1024  1024   4096  4096
+mapa2_no_xmp_clean_master.jp2  16.2   6.3   15.7   7.4 ms
+mapa2_master.jp2               26.4  15.2   26.2  18.8 ms
+mapa2_no_xmp_clean_user_1_8.jp2
+                               27.2  35.2   44.4  54.6 ms
+mapa2_user_1_8.jp2             42.2  55.2   58.8  72.1 ms
+```
+
+Full-image JPEG2000 thumbnails are where the FFI backend currently provides a functional advantage,
+not just a speed tradeoff. In this run, the CLI backend failed all tested `full/512,` JP2 requests
+through `grk_decompress`, while the FFI backend completed them successfully:
+
+```text
+source                         FFI full -> 512 render
+mapa2_no_xmp_clean_master.jp2         185.2 ms
+mapa2_master.jp2                      284.7 ms
+mapa2_no_xmp_clean_user_1_8.jp2      1182.4 ms
+mapa2_user_1_8.jp2                   1256.0 ms
 ```
 
 The TIFF and JP2 source files used for this comparison are described in the local benchmark data
 section above.
+
+The main cost of the FFI path is operational and maintenance complexity: the Docker build now
+compiles upstream Grok and generates Rust bindings against the installed `grok.h`, which requires
+`clang`/`libclang` in the build stage. The benefit is that JPEG2000 decoding stays in-process, avoids
+temporary PNM files and process spawning, can clamp reduction levels after reading the header, and
+can support full-image IIIF thumbnails that the CLI path currently does not handle reliably.
 
 Small WebP tile-size smoke run after the `pct:` IIIF update
 (`-ImageIds mapa2_no_xmp_clean.tif -Formats webp -OutputSizes 128,256 -Iterations 2 -Parallel 2 -ClearCache`):

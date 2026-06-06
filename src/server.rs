@@ -1643,6 +1643,24 @@ fn render_jpeg2000_grok_preview(
     out_width: u32,
     out_height: u32,
 ) -> Result<PreviewBitmap> {
+    #[cfg(feature = "jpeg2000-grok-ffi")]
+    {
+        return render_jpeg2000_grok_ffi_preview(path, rect, out_width, out_height)
+            .with_context(|| "rendering JPEG2000 through Grok FFI");
+    }
+    #[cfg(not(feature = "jpeg2000-grok-ffi"))]
+    {
+        render_jpeg2000_grok_cli_preview(path, rect, out_width, out_height)
+    }
+}
+
+#[cfg(all(feature = "jpeg2000-grok", not(feature = "jpeg2000-grok-ffi")))]
+fn render_jpeg2000_grok_cli_preview(
+    path: &Path,
+    rect: Rect,
+    out_width: u32,
+    out_height: u32,
+) -> Result<PreviewBitmap> {
     let total_start = Instant::now();
     let temp_path = std::env::temp_dir().join(format!(
         "gigatiff-grok-{}-{}.ppm",
@@ -1712,6 +1730,39 @@ fn render_jpeg2000_grok_preview(
             read,
             convert,
             decode,
+            ..RenderStats::default()
+        },
+    })
+}
+
+#[cfg(feature = "jpeg2000-grok-ffi")]
+fn render_jpeg2000_grok_ffi_preview(
+    path: &Path,
+    rect: Rect,
+    out_width: u32,
+    out_height: u32,
+) -> Result<PreviewBitmap> {
+    let total_start = Instant::now();
+    let ffi = crate::grok_ffi::render_region(path, rect, out_width, out_height)?;
+    let convert_start = Instant::now();
+    let rgba = if ffi.width == out_width && ffi.height == out_height {
+        ffi.rgba
+    } else {
+        resize_nearest_rgba(&ffi.rgba, ffi.width, ffi.height, out_width, out_height)
+    };
+    let resize = convert_start.elapsed();
+
+    Ok(PreviewBitmap {
+        width: out_width,
+        height: out_height,
+        rgba,
+        source: "grok-ffi-jpeg2000",
+        decoded_chunks: 1,
+        stats: RenderStats {
+            total: total_start.elapsed(),
+            read: Duration::ZERO,
+            convert: ffi.convert + resize,
+            decode: ffi.decode,
             ..RenderStats::default()
         },
     })
@@ -2122,7 +2173,15 @@ fn is_supported_image_path(path: &Path) -> bool {
 }
 
 fn error_response(status: StatusCode, err: anyhow::Error) -> Response {
-    (status, err.to_string()).into_response()
+    if std::env::var_os("GIGATIFF_VERBOSE_ERRORS").is_none() {
+        return (status, err.to_string()).into_response();
+    }
+    let mut message = err.to_string();
+    for cause in err.chain().skip(1) {
+        message.push_str("\ncaused by: ");
+        message.push_str(&cause.to_string());
+    }
+    (status, message).into_response()
 }
 
 #[cfg(test)]
