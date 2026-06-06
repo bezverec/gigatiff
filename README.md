@@ -459,6 +459,46 @@ encoding, and persistent response cache used by TIFF responses.
 
 ## Benchmarks
 
+### Local Benchmark Data
+
+The large benchmark/sample images are intentionally not stored in the repository. Local runs used two
+TIFF files in the project root and four derived JPEG2000 files under `images/`; `*.tif`, `*.tiff`,
+and `*.jp2` are ignored by Git.
+
+```text
+file                              size       dimensions     samples  layout
+mapa2_no_xmp_clean.tif            3.34 GiB   41174 x 29077  RGB 8    classic TIFF, uncompressed strips, rows/strip 1024, no ICC
+mapa2.tif                         6.69 GiB   41174 x 29077  RGB 16   BigTIFF, one uncompressed strip, embedded ICC 1992 bytes
+images/mapa2_no_xmp_clean_master.jp2
+                                  1.36 GiB   41174 x 29077  RGB 8    JP2 master, 4096 x 4096 tiles
+images/mapa2_no_xmp_clean_user_1_8.jp2
+                                  0.42 GiB   41174 x 29077  RGB 8    JP2 user copy, 1024 x 1024 tiles
+images/mapa2_master.jp2           4.65 GiB   41174 x 29077  RGB 16   JP2 master, 4096 x 4096 tiles
+images/mapa2_user_1_8.jp2         0.84 GiB   41174 x 29077  RGB 16   JP2 user copy, 1024 x 1024 tiles
+```
+
+The JP2 master copies were generated with Grok from each TIFF sample:
+
+```bash
+grk_compress -i example.tif -o example_master.jp2 \
+  -t 4096,4096 -p RPCL -n 6 \
+  -c "[256,256],[256,256],[128,128],[128,128],[128,128],[128,128]" \
+  -b 64,64 -X -M 1 -S -E -u R -H 1
+```
+
+The JP2 user copies used the 1:8 rate list and irreversible transform:
+
+```bash
+grk_compress -i example.tif -o example_user_1_8.jp2 \
+  -r "362,256,181,128,90,64,45,32,22,16,11,8" -I \
+  -t 1024,1024 -p RPCL -n 6 \
+  -c "[256,256],[256,256],[128,128],[128,128],[128,128],[128,128]" \
+  -b 64,64 -X -M 1 -u R -H 1
+```
+
+The `-H 1` thread limit was required for reliable conversion of the multi-gigabyte TIFF inputs in
+Docker. Without it, Grok was killed during the larger conversions due to peak memory pressure.
+
 ### Desktop and CLI Benchmarks
 
 These are informal release-build measurements from the local sample files on this machine. The binary
@@ -535,10 +575,8 @@ mapa2_master.jp2                   30.2 ms      30.2 ms
 mapa2_user_1_8.jp2                 49.9 ms     150.8 ms
 ```
 
-The JP2 fixtures were generated from the local TIFF samples with Grok. Master copies used 4096 x
-4096 tiles, RPCL progression, six resolutions, and `-H 1`; user copies used the 1:8 rate list,
-irreversible transform, 1024 x 1024 tiles, and `-H 1`. The thread limit was required for reliable
-conversion of the multi-gigabyte TIFF inputs in Docker.
+The TIFF and JP2 source files used for this comparison are described in the local benchmark data
+section above.
 
 Small WebP tile-size smoke run after the `pct:` IIIF update
 (`-ImageIds mapa2_no_xmp_clean.tif -Formats webp -OutputSizes 128,256 -Iterations 2 -Parallel 2 -ClearCache`):
