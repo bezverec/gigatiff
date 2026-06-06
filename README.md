@@ -765,20 +765,30 @@ need to allocate roughly the whole image, which is exactly the memory pressure t
 
 ## Next Steps
 
-Useful next optimization steps for the desktop viewer:
+Useful next steps for the desktop viewer:
 
 - add automated GUI interaction benchmarks for pan/zoom/tile warm-cache scenarios,
 - tune tile sizing, worker count, overview-cache size, and eviction policy from those GUI benchmarks,
 - benchmark and tune the explicit SIMD RGB8/RGBA8 path against more sampling ratios,
 - continue Linux and macOS runtime validation, packaging, and file-dialog checks.
 
-Useful next optimization steps for the image server:
+Useful next steps for the image server:
 
-- run tile-size benchmark sweeps for WebP/JPEG/PNG and record the best default tile/output settings,
+- keep the Grok FFI backend as the default Docker path and preserve the CLI backend as a fallback
+  build feature,
+- add CI coverage for `server,jpeg2000-grok-ffi` in a Linux container with upstream Grok installed,
+- investigate why lower-rate JP2 user-copy region requests are slower through FFI than through the
+  CLI backend, especially around Grok reduction/update behavior and component copy cost,
+- benchmark full-image JP2 thumbnails separately from tile/region requests and tune reduction
+  selection for `full/<width>,` IIIF requests,
+- run tile-size and output-size sweeps for WebP/JPEG/PNG and record the best default request shapes,
 - add automated OpenSeadragon browser smoke tests on top of the current HTTP-level IIIF smoke test,
 - evaluate lossy WebP encoding options once the Rust ecosystem path is stable enough for release builds.
 
-Useful next deployment steps:
+Useful next release and deployment steps:
 
+- publish a Linux server Docker image after the Grok FFI CI path is stable,
+- document the server support policy explicitly: native Linux first, Docker/Podman for other systems,
 - add Caddy auth/TLS examples for team sharing,
-- consider publishing a Docker image after the server API stabilizes.
+- decide whether the next public version is a combined `0.3.0` release or separate Desktop/Server
+  version labels.
