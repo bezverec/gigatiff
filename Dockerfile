@@ -1,12 +1,12 @@
 # syntax=docker/dockerfile:1
 
-FROM rust:1-bookworm AS build
+FROM rust:1-trixie AS build
 
 ARG GROK_VERSION=v20.3.3
 ARG GIGATIFF_BUILD_GROK=1
 ARG GIGATIFF_SERVER_FEATURES=server,jpeg2000-grok-ffi
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     ca-certificates \
     clang \
     cmake \
@@ -38,9 +38,9 @@ WORKDIR /app
 COPY . .
 RUN cargo build --release --locked --bin gigatiff-server --no-default-features --features ${GIGATIFF_SERVER_FEATURES}
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     ca-certificates \
     liblcms2-2 \
     libstdc++6 \
