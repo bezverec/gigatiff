@@ -107,6 +107,9 @@ jobs:
         run: ./scripts/new-test-tiff.ps1 -OutPath images/ci-smoke.tif -Width 64 -Height 64
 
       - name: Start compose stack
+        env:
+          GIGATIFF_BUILD_GROK: "0"
+          GIGATIFF_SERVER_FEATURES: server
         run: docker compose up -d --build
 
       - name: Wait for IIIF server

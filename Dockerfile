@@ -3,6 +3,7 @@
 FROM rust:1-bookworm AS build
 
 ARG GROK_VERSION=v20.3.3
+ARG GIGATIFF_BUILD_GROK=1
 ARG GIGATIFF_SERVER_FEATURES=server,jpeg2000-grok-ffi
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -18,18 +19,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
   && rm -rf /var/lib/apt/lists/*
 
-RUN git clone --depth 1 --branch ${GROK_VERSION} --recursive https://github.com/GrokImageCompression/grok.git /tmp/grok \
-  && cmake -S /tmp/grok -B /tmp/grok-build \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_INSTALL_PREFIX=/usr/local \
-    -DBUILD_SHARED_LIBS=ON \
-    -DBUILD_TESTING=OFF \
-    -DGRK_BUILD_CODEC=ON \
-    -DGRK_BUILD_DOC=OFF \
-  && cmake --build /tmp/grok-build --parallel \
-  && cmake --install /tmp/grok-build \
-  && ldconfig \
-  && rm -rf /tmp/grok /tmp/grok-build
+RUN if [ "${GIGATIFF_BUILD_GROK}" = "1" ]; then \
+    git clone --depth 1 --branch ${GROK_VERSION} --recursive https://github.com/GrokImageCompression/grok.git /tmp/grok \
+    && cmake -S /tmp/grok -B /tmp/grok-build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/usr/local \
+      -DBUILD_SHARED_LIBS=ON \
+      -DBUILD_TESTING=OFF \
+      -DGRK_BUILD_CODEC=ON \
+      -DGRK_BUILD_DOC=OFF \
+    && cmake --build /tmp/grok-build --parallel \
+    && cmake --install /tmp/grok-build \
+    && ldconfig \
+    && rm -rf /tmp/grok /tmp/grok-build; \
+  fi
 
 WORKDIR /app
 COPY . .

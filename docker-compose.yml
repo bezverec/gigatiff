@@ -1,6 +1,10 @@
 services:
   gigatiff-server:
-    build: .
+    build:
+      context: .
+      args:
+        GIGATIFF_BUILD_GROK: ${GIGATIFF_BUILD_GROK:-1}
+        GIGATIFF_SERVER_FEATURES: ${GIGATIFF_SERVER_FEATURES:-server,jpeg2000-grok-ffi}
     command:
       - --root
       - /data
