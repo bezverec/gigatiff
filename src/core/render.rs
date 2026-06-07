@@ -13,10 +13,12 @@ use rayon::prelude::*;
 use tiff::ColorType;
 use tiff::decoder::{ChunkType, Decoder, DecodingResult};
 
-use crate::cache::{OverviewCacheKey, ScanlineCache, ScanlineKey};
-use crate::color::{ColorTransform, bits_for_color, samples_for_color, write_sampled_row_rgba};
+use crate::core::cache::{OverviewCacheKey, ScanlineCache, ScanlineKey};
+use crate::core::color::{
+    ColorTransform, bits_for_color, samples_for_color, write_sampled_row_rgba,
+};
+use crate::core::tiff_info::{ImageInfo, can_read_raw_strips, open_decoder};
 use crate::options::{Backend, PngCompression};
-use crate::tiff_info::{ImageInfo, can_read_raw_strips, open_decoder};
 
 const PARALLEL_ROW_BATCH: usize = 32;
 

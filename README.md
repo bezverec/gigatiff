@@ -369,6 +369,20 @@ cargo test --locked --no-default-features --features server --lib --bin gigatiff
 The GUI has been primarily exercised on Windows so far. Linux/macOS runtime testing is the next
 portability step after CI confirms the project compiles on all three platforms.
 
+## Project Layout
+
+Shared image handling lives in `src/core/`:
+
+- `cache.rs` contains scanline/tile/overview cache primitives,
+- `color.rs` contains color conversion and fast-path row sampling,
+- `render.rs` contains preview rendering, sampling, and PNG export,
+- `tiff_info.rs` contains TIFF metadata loading and decoder helpers,
+- `grok_ffi.rs` contains the optional Grok JPEG2000 FFI backend.
+
+The desktop UI remains in `src/gui.rs`, the command-line desktop entry point in `src/cli.rs`, and
+the IIIF image server in `src/server.rs`. This keeps the current repository unified while making the
+future workspace split into core, desktop, and server crates less disruptive.
+
 ## Current Crates
 
 Direct dependencies are pinned to current crates.io releases:

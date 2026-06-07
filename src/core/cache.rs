@@ -9,8 +9,8 @@ use anyhow::{Context, Result};
 #[cfg(feature = "desktop")]
 use eframe::egui;
 
-use crate::render::{PreviewRequest, RenderStats};
-use crate::tiff_info::ImageInfo;
+use crate::core::render::{PreviewRequest, RenderStats};
+use crate::core::tiff_info::ImageInfo;
 
 const OVERVIEW_MAGIC: &[u8; 8] = b"GTOV0001";
 const OVERVIEW_CACHE_LIMIT: u64 = 256 * 1024 * 1024;

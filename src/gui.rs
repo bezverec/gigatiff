@@ -10,16 +10,16 @@ use std::thread;
 use anyhow::{Result, anyhow};
 use eframe::egui;
 
-use crate::cache::{
+use crate::core::cache::{
     CachedOverview, OverviewCacheKey, PersistentOverviewCache, ScanlineCache, TileTexture,
     TileTextureCache,
 };
-use crate::options::{Backend, PngCompression};
-use crate::render::{
+use crate::core::render::{
     PreviewBitmap, PreviewRequest, Rect, RenderCancel, RenderJob, RenderJobKind, RenderResult,
     render_preview, save_png,
 };
-use crate::tiff_info::{ImageInfo, load_info};
+use crate::core::tiff_info::{ImageInfo, load_info};
+use crate::options::{Backend, PngCompression};
 
 const GUI_TILE_SIZE: f32 = 384.0;
 const GUI_PREFETCH_TILE_RADIUS: u32 = 1;

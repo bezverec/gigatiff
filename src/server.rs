@@ -28,9 +28,9 @@ use tokio::sync::Semaphore;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
+use crate::core::render::{PreviewBitmap, Rect, RenderStats, clamp_rect, render_preview};
+use crate::core::tiff_info::{ImageInfo, load_info};
 use crate::options::{Backend, PngCompression};
-use crate::render::{PreviewBitmap, Rect, RenderStats, clamp_rect, render_preview};
-use crate::tiff_info::{ImageInfo, load_info};
 
 const ID_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b' ')
@@ -1743,7 +1743,7 @@ fn render_jpeg2000_grok_ffi_preview(
     out_height: u32,
 ) -> Result<PreviewBitmap> {
     let total_start = Instant::now();
-    let ffi = crate::grok_ffi::render_region(path, rect, out_width, out_height)?;
+    let ffi = crate::core::grok_ffi::render_region(path, rect, out_width, out_height)?;
     let convert_start = Instant::now();
     let rgba = if ffi.width == out_width && ffi.height == out_height {
         ffi.rgba

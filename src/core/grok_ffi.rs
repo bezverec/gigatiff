@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use grokj2k_sys as grk;
 
-use crate::render::Rect;
+use crate::core::render::Rect;
 
 static INIT: Once = Once::new();
 
