@@ -267,7 +267,9 @@ the same smoke test with smaller regions:
 ```
 
 GitHub Actions includes an `IIIF server smoke` job that generates this fixture, starts the Docker
-Compose stack, and runs the smoke test on pushes and pull requests.
+Compose stack, and runs the smoke test when the workflow is started manually or for GitHub pull
+requests. Routine Linux server checks are intentionally handled by Codeberg/Woodpecker to avoid
+spending GitHub Actions minutes on every push.
 
 ### Server Benchmarks
 
@@ -352,7 +354,17 @@ cargo build
 ## Platform Notes
 
 The project has a GitHub Actions CI workflow for Windows, Linux, and macOS. Windows uses vcpkg in CI,
-while Linux and macOS use `pkg-config` to discover libtiff.
+while Linux and macOS use `pkg-config` to discover libtiff. GitHub CI is intentionally limited to
+manual runs and GitHub pull requests so release packaging does not consume minutes on every push.
+
+The Codeberg mirror contains a Woodpecker pipeline for routine Linux server checks. It runs in a
+`rust:1-trixie` container, installs libtiff/lcms2 development packages, checks formatting, and runs
+the server-only test target:
+
+```bash
+cargo fmt --all --check
+cargo test --locked --no-default-features --features server --lib --bin gigatiff-server
+```
 
 The GUI has been primarily exercised on Windows so far. Linux/macOS runtime testing is the next
 portability step after CI confirms the project compiles on all three platforms.
@@ -380,9 +392,9 @@ tower-http = 0.6.11
 ```
 
 Desktop-specific dependencies are behind the `desktop` feature, and server-specific HTTP/encoding
-dependencies are behind the `server` feature. The default build enables only `desktop`; CI checks the
-desktop app on Windows, Linux, and macOS, and checks the server path on Linux through a server-only
-build plus Docker-based IIIF smoke test.
+dependencies are behind the `server` feature. The default build enables only `desktop`; GitHub CI can
+check the desktop app on Windows, Linux, and macOS, while Codeberg/Woodpecker handles the routine
+Linux server-only path.
 
 The `jpeg2000-grok` Cargo feature does not add Rust crate dependencies; it enables the server-side
 Grok command backend and requires `grk_dump` and `grk_decompress` at runtime.

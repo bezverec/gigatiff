@@ -1,0 +1,11 @@
+when:
+  - event: [push, pull_request, manual]
+
+steps:
+  - name: server
+    image: rust:1-trixie
+    commands:
+      - apt-get update
+      - DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libtiff-dev liblcms2-dev pkg-config
+      - cargo fmt --all --check
+      - cargo test --locked --no-default-features --features server --lib --bin gigatiff-server
