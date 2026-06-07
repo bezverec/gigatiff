@@ -11,14 +11,14 @@ pub(crate) struct ScanlineKey {
     pub(crate) bytes_per_pixel: usize,
 }
 
-pub(crate) struct ScanlineCache {
+pub struct ScanlineCache {
     pub(crate) entries: VecDeque<(ScanlineKey, Arc<Vec<u8>>)>,
     pub(crate) byte_limit: usize,
     pub(crate) bytes: usize,
 }
 
 impl ScanlineCache {
-    pub(crate) fn new(byte_limit: usize) -> Self {
+    pub fn new(byte_limit: usize) -> Self {
         Self {
             entries: VecDeque::new(),
             byte_limit,

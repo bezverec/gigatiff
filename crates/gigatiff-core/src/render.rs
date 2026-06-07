@@ -13,38 +13,36 @@ use rayon::prelude::*;
 use tiff::ColorType;
 use tiff::decoder::{ChunkType, Decoder, DecodingResult};
 
-use crate::core::cache::{ScanlineCache, ScanlineKey};
-use crate::core::color::{
-    ColorTransform, bits_for_color, samples_for_color, write_sampled_row_rgba,
-};
-use crate::core::tiff_info::{ImageInfo, can_read_raw_strips, open_decoder};
+use crate::cache::{ScanlineCache, ScanlineKey};
+use crate::color::{ColorTransform, bits_for_color, samples_for_color, write_sampled_row_rgba};
 use crate::options::{Backend, PngCompression};
+use crate::tiff_info::{ImageInfo, can_read_raw_strips, open_decoder};
 
 const PARALLEL_ROW_BATCH: usize = 32;
 
 #[derive(Debug)]
-pub(crate) struct PreviewBitmap {
-    pub(crate) width: u32,
-    pub(crate) height: u32,
-    pub(crate) rgba: Vec<u8>,
-    pub(crate) source: &'static str,
-    pub(crate) decoded_chunks: u32,
-    pub(crate) stats: RenderStats,
+pub struct PreviewBitmap {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+    pub source: &'static str,
+    pub decoded_chunks: u32,
+    pub stats: RenderStats,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct RenderStats {
-    pub(crate) total: Duration,
-    pub(crate) read: Duration,
-    pub(crate) convert: Duration,
-    pub(crate) decode: Duration,
-    pub(crate) blit: Duration,
-    pub(crate) scanline_cache_hits: u32,
-    pub(crate) scanline_cache_misses: u32,
+pub struct RenderStats {
+    pub total: Duration,
+    pub read: Duration,
+    pub convert: Duration,
+    pub decode: Duration,
+    pub blit: Duration,
+    pub scanline_cache_hits: u32,
+    pub scanline_cache_misses: u32,
 }
 
 impl RenderStats {
-    pub(crate) fn short_label(self) -> String {
+    pub fn short_label(self) -> String {
         let mut label = format!(
             "total {:.1} ms, read {:.1} ms, convert {:.1} ms",
             ms(self.total),
@@ -62,7 +60,7 @@ impl RenderStats {
     }
 }
 
-pub(crate) fn ms(duration: Duration) -> f64 {
+pub fn ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
 }
 
@@ -99,13 +97,13 @@ impl SamplingPlan {
     }
 }
 
-pub(crate) struct RenderCancel {
-    pub(crate) latest_generation: Arc<AtomicU64>,
-    pub(crate) generation: u64,
+pub struct RenderCancel {
+    pub latest_generation: Arc<AtomicU64>,
+    pub generation: u64,
 }
 
 impl RenderCancel {
-    pub(crate) fn check(&self) -> Result<()> {
+    pub fn check(&self) -> Result<()> {
         if self.latest_generation.load(Ordering::Relaxed) != self.generation {
             bail!("render cancelled");
         }
@@ -113,7 +111,7 @@ impl RenderCancel {
     }
 }
 
-pub(crate) fn render_preview(
+pub fn render_preview(
     path: &Path,
     info: &ImageInfo,
     rect: Rect,
@@ -718,7 +716,7 @@ fn blit_chunk_to_preview(
     }
 }
 
-pub(crate) fn save_png(
+pub fn save_png(
     path: &Path,
     width: u32,
     height: u32,
@@ -736,14 +734,14 @@ pub(crate) fn save_png(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct Rect {
-    pub(crate) x: u32,
-    pub(crate) y: u32,
-    pub(crate) width: u32,
-    pub(crate) height: u32,
+pub struct Rect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
 }
 
-pub(crate) fn clamp_rect(
+pub fn clamp_rect(
     x: u32,
     y: u32,
     width: u32,
@@ -763,7 +761,7 @@ pub(crate) fn clamp_rect(
     })
 }
 
-pub(crate) fn fit_size(width: u32, height: u32, max_output: u32) -> (u32, u32) {
+pub fn fit_size(width: u32, height: u32, max_output: u32) -> (u32, u32) {
     if width <= max_output && height <= max_output {
         return (width, height);
     }

@@ -10,28 +10,28 @@ use tiff::decoder::{ChunkType, Decoder, Limits};
 use tiff::tags::Tag;
 
 #[derive(Debug, Clone)]
-pub(crate) struct ImageInfo {
-    pub(crate) width: u32,
-    pub(crate) height: u32,
-    pub(crate) color_type: ColorType,
-    pub(crate) chunk_type: ChunkType,
-    pub(crate) chunk_width: u32,
-    pub(crate) chunk_height: u32,
-    pub(crate) chunk_count: u32,
-    pub(crate) chunks_across: u32,
-    pub(crate) compression: Option<u32>,
-    pub(crate) bits_per_sample: Option<Vec<u16>>,
-    pub(crate) samples_per_pixel: Option<u32>,
-    pub(crate) planar_config: Option<u32>,
-    pub(crate) photometric: Option<u32>,
-    pub(crate) is_bigtiff: bool,
-    pub(crate) little_endian: bool,
-    pub(crate) rows_per_strip: Option<u32>,
-    pub(crate) strip_offsets: Option<Vec<u64>>,
-    pub(crate) icc_profile: Option<Arc<[u8]>>,
+pub struct ImageInfo {
+    pub width: u32,
+    pub height: u32,
+    pub color_type: ColorType,
+    pub chunk_type: ChunkType,
+    pub chunk_width: u32,
+    pub chunk_height: u32,
+    pub chunk_count: u32,
+    pub chunks_across: u32,
+    pub compression: Option<u32>,
+    pub bits_per_sample: Option<Vec<u16>>,
+    pub samples_per_pixel: Option<u32>,
+    pub planar_config: Option<u32>,
+    pub photometric: Option<u32>,
+    pub is_bigtiff: bool,
+    pub little_endian: bool,
+    pub rows_per_strip: Option<u32>,
+    pub strip_offsets: Option<Vec<u64>>,
+    pub icc_profile: Option<Arc<[u8]>>,
 }
 
-pub(crate) fn print_info(path: &Path) -> Result<()> {
+pub fn print_info(path: &Path) -> Result<()> {
     let info = load_info(path)?;
 
     println!("file: {}", path.display());
@@ -76,7 +76,7 @@ pub(crate) fn open_decoder(path: &Path, max_chunk_mb: usize) -> Result<Decoder<B
     Ok(decoder)
 }
 
-pub(crate) fn load_info(path: &Path) -> Result<ImageInfo> {
+pub fn load_info(path: &Path) -> Result<ImageInfo> {
     let mut decoder = open_decoder(path, 256)?;
     read_info(path, &mut decoder)
 }

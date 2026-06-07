@@ -8,8 +8,8 @@ use std::time::UNIX_EPOCH;
 use anyhow::{Context, Result};
 use eframe::egui;
 
-use crate::core::render::RenderStats;
-use crate::core::tiff_info::ImageInfo;
+use gigatiff_core::render::RenderStats;
+use gigatiff_core::tiff_info::ImageInfo;
 
 use super::render_queue::PreviewRequest;
 

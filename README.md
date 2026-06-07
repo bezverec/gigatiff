@@ -13,35 +13,36 @@ is still available as a CLI fallback for supported files.
 
 ## Source Layout
 
-The prototype is split into focused Rust modules:
+The repository is a Cargo workspace with three first-party crates:
 
-- `src/cli.rs` handles command-line parsing and CLI command dispatch,
-- `src/gui.rs` contains the egui/eframe viewer, tile scheduling, and GUI export flow,
-- `src/render.rs` contains viewport rendering, libtiff/raw-strip backends, PNG writing, and render request types,
-- `src/tiff_info.rs` reads TIFF metadata and handles TIFF decoder setup,
-- `src/color.rs` contains lcms2 transforms and raw sample-to-RGBA conversion,
-- `src/cache.rs` contains LRU caches for GUI tile textures and source-row segments,
-- `src/server.rs` contains the experimental IIIF/OpenSeadragon image server,
-- `src/bin/gigatiff-server.rs` is the separate server entry point.
+- `crates/gigatiff-core` contains shared TIFF/BigTIFF metadata loading, rendering, color conversion,
+  PNG export, scanline cache primitives, and the optional Grok JPEG2000 FFI bridge.
+- `crates/gigatiff-desktop` builds the cross-platform `gigatiff` desktop/CLI binary with the
+  egui/eframe viewer, native file dialogs, recent files, GUI tile scheduling, and PNG viewport export.
+- `crates/gigatiff-server` builds the Linux/container-targeted `gigatiff-server` IIIF/OpenSeadragon
+  image server.
+
+The vendored `vendor/grokj2k-sys` package is intentionally excluded from default workspace checks. It
+is only built when `gigatiff-server` enables the `jpeg2000-grok-ffi` feature.
 
 ## Build
 
-Debug build:
+Debug workspace build:
 
 ```powershell
 cargo build
 ```
 
-Optimized release build:
+Optimized desktop release build:
 
 ```powershell
-cargo build --release
+cargo build --release -p gigatiff-desktop --bin gigatiff
 ```
 
 CPU-specific release build for the current machine:
 
 ```powershell
-$env:RUSTFLAGS="-C target-cpu=native"; cargo build --release
+$env:RUSTFLAGS="-C target-cpu=native"; cargo build --release -p gigatiff-desktop --bin gigatiff
 ```
 
 Executables:
@@ -51,8 +52,8 @@ target\debug\gigatiff.exe
 target\release\gigatiff.exe
 ```
 
-The default Cargo feature set builds the desktop application only. The server binary is built
-explicitly with `--no-default-features --features server`.
+The root `cargo build` command builds the workspace packages. Use `-p gigatiff-desktop` or
+`-p gigatiff-server` when you want to build one application surface explicitly.
 
 The build script copies `tiff.dll` next to the executable in `target/debug` or `target/release`.
 
@@ -157,15 +158,15 @@ files under a root directory through a small IIIF Image API 3.0-compatible surfa
 minimal OpenSeadragon viewer.
 
 ```bash
-cargo build --release --bin gigatiff-server --no-default-features --features server
+cargo build --release -p gigatiff-server --bin gigatiff-server
 target/release/gigatiff-server --root /path/to/tiffs --addr 127.0.0.1:8080
 ```
 
-Supported source files in the base server feature are `.tif` and `.tiff`. JPEG2000 support is
+Supported source files in the base server package are `.tif` and `.tiff`. JPEG2000 support is
 available through the optional `jpeg2000-grok` feature, which shells out to Grok tools:
 
 ```bash
-cargo build --release --bin gigatiff-server --no-default-features --features server,jpeg2000-grok
+cargo build --release -p gigatiff-server --bin gigatiff-server --features jpeg2000-grok
 target/release/gigatiff-server --root /path/to/images --addr 127.0.0.1:8080
 ```
 
@@ -224,14 +225,15 @@ Server-only builds avoid the desktop GUI dependencies and are the expected nativ
 Linux. Use the base command for TIFF-only deployments:
 
 ```bash
-cargo build --release --bin gigatiff-server --no-default-features --features server
+cargo build --release -p gigatiff-server --bin gigatiff-server
 ```
 
-Use `server,jpeg2000-grok` for TIFF plus JPEG2000 deployments.
+Use `--features jpeg2000-grok` for TIFF plus JPEG2000 deployments through Grok command-line tools,
+or `--features jpeg2000-grok-ffi` for the direct Grok FFI backend used by the Docker image.
 
 ### Docker and Caddy
 
-The Docker image builds only the server feature plus the Grok JPEG2000 backend and expects image files
+The Docker image builds the server package plus the Grok JPEG2000 FFI backend and expects image files
 mounted at `/data`:
 
 ```bash
@@ -363,7 +365,7 @@ the server-only test target:
 
 ```bash
 cargo fmt --all --check
-cargo test --locked --no-default-features --features server --lib --bin gigatiff-server
+cargo test --locked -p gigatiff-server --lib --bin gigatiff-server
 ```
 
 The GUI has been primarily exercised on Windows so far. Linux/macOS runtime testing is the next
@@ -371,19 +373,27 @@ portability step after CI confirms the project compiles on all three platforms.
 
 ## Project Layout
 
-Shared image handling lives in `src/core/`:
+Shared image handling lives in `crates/gigatiff-core/src/`:
 
 - `cache.rs` contains shared scanline cache primitives,
 - `color.rs` contains color conversion and fast-path row sampling,
 - `render.rs` contains preview rendering, sampling, and PNG export,
 - `tiff_info.rs` contains TIFF metadata loading and decoder helpers,
-- `grok_ffi.rs` contains the optional Grok JPEG2000 FFI backend.
+- `grok_ffi.rs` contains the optional Grok JPEG2000 FFI backend,
+- `options.rs` contains shared backend and PNG compression enums.
 
-The desktop UI remains in `src/gui.rs`, with desktop-only tile/overview cache code in
-`src/gui/cache.rs` and GUI render queue types in `src/gui/render_queue.rs`. The command-line desktop
-entry point remains in `src/cli.rs`, and the IIIF image server remains in `src/server.rs`. This keeps
-the current repository unified while making the future workspace split into core, desktop, and server
-crates less disruptive.
+The desktop application lives in `crates/gigatiff-desktop/src/`:
+
+- `main.rs` is the `gigatiff` binary entry point,
+- `cli.rs` handles command-line parsing and CLI command dispatch,
+- `gui.rs` contains the egui/eframe viewer,
+- `gui/cache.rs` contains desktop-only tile/overview cache code,
+- `gui/render_queue.rs` contains GUI render queue types.
+
+The server application lives in `crates/gigatiff-server/src/`:
+
+- `main.rs` is the `gigatiff-server` binary entry point,
+- `lib.rs` contains the IIIF/OpenSeadragon server implementation and server tests.
 
 ## Current Crates
 
@@ -407,13 +417,15 @@ tokio   = 1.52.3
 tower-http = 0.6.11
 ```
 
-Desktop-specific dependencies are behind the `desktop` feature, and server-specific HTTP/encoding
-dependencies are behind the `server` feature. The default build enables only `desktop`; GitHub CI can
-check the desktop app on Windows, Linux, and macOS, while Codeberg/Woodpecker handles the routine
-Linux server-only path.
+Desktop-specific dependencies are isolated in the `gigatiff-desktop` package, and server-specific
+HTTP/encoding dependencies are isolated in the `gigatiff-server` package. GitHub CI can check the
+desktop app on Windows, Linux, and macOS, while Codeberg/Woodpecker handles the routine Linux
+server-only path.
 
-The `jpeg2000-grok` Cargo feature does not add Rust crate dependencies; it enables the server-side
-Grok command backend and requires `grk_dump` and `grk_decompress` at runtime.
+The `jpeg2000-grok` feature on `gigatiff-server` does not add Rust crate dependencies; it enables the
+server-side Grok command backend and requires `grk_dump` and `grk_decompress` at runtime. The
+`jpeg2000-grok-ffi` feature additionally enables `gigatiff-core/jpeg2000-grok-ffi` and builds the
+vendored `grokj2k-sys` bindings.
 
 ## Color Management
 
@@ -533,7 +545,7 @@ These are informal release-build measurements from the local sample files on thi
 was built with:
 
 ```powershell
-$env:RUSTFLAGS="-C target-cpu=native"; cargo build --release
+$env:RUSTFLAGS="-C target-cpu=native"; cargo build --release -p gigatiff-desktop --bin gigatiff
 ```
 
 For a 2048 x 2048 source viewport exported as a 512 x 512 PNG:
@@ -718,7 +730,7 @@ $llvmProfdata = "$env:USERPROFILE\.rustup\toolchains\stable-x86_64-pc-windows-ms
 
 ```powershell
 $env:RUSTFLAGS="-C target-cpu=native -C profile-generate=C:\temp\tiffreader\target\pgo-data"
-cargo build --release
+cargo build --release -p gigatiff-desktop --bin gigatiff
 ```
 
 2. Run representative workloads:
@@ -741,7 +753,7 @@ target\release\gigatiff.exe preview mapa2.tif --backend libtiff --x 0 --y 0 --wi
 
 ```powershell
 $env:RUSTFLAGS="-C target-cpu=native -C profile-use=C:\temp\tiffreader\target\pgo\gigatiff-pgo.profdata -C llvm-args=-pgo-warn-missing-function"
-cargo build --release
+cargo build --release -p gigatiff-desktop --bin gigatiff
 ```
 
 ## Capabilities
@@ -804,7 +816,7 @@ Useful next steps for the image server:
 
 - keep the Grok FFI backend as the default Docker path and preserve the CLI backend as a fallback
   build feature,
-- add CI coverage for `server,jpeg2000-grok-ffi` in a Linux container with upstream Grok installed,
+- add CI coverage for `gigatiff-server --features jpeg2000-grok-ffi` in a Linux container with upstream Grok installed,
 - investigate why lower-rate JP2 user-copy region requests are slower through FFI than through the
   CLI backend, especially around Grok reduction/update behavior and component copy cost,
 - benchmark full-image JP2 thumbnails separately from tile/region requests and tune reduction

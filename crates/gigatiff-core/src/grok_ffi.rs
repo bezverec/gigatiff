@@ -8,19 +8,19 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use grokj2k_sys as grk;
 
-use crate::core::render::Rect;
+use crate::render::Rect;
 
 static INIT: Once = Once::new();
 
-pub(crate) struct GrokFfiBitmap {
-    pub(crate) width: u32,
-    pub(crate) height: u32,
-    pub(crate) rgba: Vec<u8>,
-    pub(crate) decode: Duration,
-    pub(crate) convert: Duration,
+pub struct GrokFfiBitmap {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+    pub decode: Duration,
+    pub convert: Duration,
 }
 
-pub(crate) fn render_region(
+pub fn render_region(
     path: &Path,
     rect: Rect,
     out_width: u32,

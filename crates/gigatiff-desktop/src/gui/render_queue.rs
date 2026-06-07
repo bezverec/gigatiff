@@ -2,9 +2,9 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use crate::core::render::{PreviewBitmap, Rect};
-use crate::core::tiff_info::ImageInfo;
-use crate::options::Backend;
+use gigatiff_core::options::Backend;
+use gigatiff_core::render::{PreviewBitmap, Rect};
+use gigatiff_core::tiff_info::ImageInfo;
 
 use super::cache::OverviewCacheKey;
 

@@ -4,10 +4,10 @@ use std::time::Instant;
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 
-use crate::core::render::{clamp_rect, ms, render_preview, save_png};
-use crate::core::tiff_info::{load_info, print_info};
 use crate::gui::run_gui;
-use crate::options::{Backend, PngCompression};
+use gigatiff_core::options::{Backend, PngCompression};
+use gigatiff_core::render::{clamp_rect, ms, render_preview, save_png};
+use gigatiff_core::tiff_info::{load_info, print_info};
 
 #[derive(Parser, Debug)]
 #[command(

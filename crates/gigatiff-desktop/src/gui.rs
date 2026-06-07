@@ -13,10 +13,10 @@ use eframe::egui;
 mod cache;
 mod render_queue;
 
-use crate::core::cache::ScanlineCache;
-use crate::core::render::{PreviewBitmap, Rect, RenderCancel, render_preview, save_png};
-use crate::core::tiff_info::{ImageInfo, load_info};
-use crate::options::{Backend, PngCompression};
+use gigatiff_core::cache::ScanlineCache;
+use gigatiff_core::options::{Backend, PngCompression};
+use gigatiff_core::render::{PreviewBitmap, Rect, RenderCancel, render_preview, save_png};
+use gigatiff_core::tiff_info::{ImageInfo, load_info};
 
 use self::cache::{
     CachedOverview, OverviewCacheKey, PersistentOverviewCache, TileTexture, TileTextureCache,

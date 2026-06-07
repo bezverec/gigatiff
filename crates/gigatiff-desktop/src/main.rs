@@ -1,3 +1,3 @@
 fn main() -> anyhow::Result<()> {
-    gigatiff::cli::run()
+    gigatiff_desktop::cli::run()
 }

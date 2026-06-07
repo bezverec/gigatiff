@@ -1,0 +1,18 @@
+[package]
+name = "gigatiff-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "gigatiff"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap = { workspace = true, features = ["derive"] }
+eframe.workspace = true
+gigatiff-core = { path = "../gigatiff-core" }
+rfd.workspace = true
+tiff.workspace = true

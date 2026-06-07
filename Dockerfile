@@ -4,7 +4,7 @@ FROM rust:1-trixie AS build
 
 ARG GROK_VERSION=v20.3.3
 ARG GIGATIFF_BUILD_GROK=1
-ARG GIGATIFF_SERVER_FEATURES=server,jpeg2000-grok-ffi
+ARG GIGATIFF_SERVER_FEATURES=jpeg2000-grok-ffi
 
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     ca-certificates \
@@ -36,7 +36,11 @@ RUN if [ "${GIGATIFF_BUILD_GROK}" = "1" ]; then \
 
 WORKDIR /app
 COPY . .
-RUN cargo build --release --locked --bin gigatiff-server --no-default-features --features ${GIGATIFF_SERVER_FEATURES}
+RUN if [ -n "${GIGATIFF_SERVER_FEATURES}" ]; then \
+      cargo build --release --locked -p gigatiff-server --bin gigatiff-server --features "${GIGATIFF_SERVER_FEATURES}"; \
+    else \
+      cargo build --release --locked -p gigatiff-server --bin gigatiff-server; \
+    fi
 
 FROM debian:trixie-slim
 

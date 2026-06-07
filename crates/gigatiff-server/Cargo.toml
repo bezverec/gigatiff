@@ -1,0 +1,31 @@
+[package]
+name = "gigatiff-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+jpeg2000-grok = []
+jpeg2000-grok-ffi = ["jpeg2000-grok", "gigatiff-core/jpeg2000-grok-ffi"]
+
+[[bin]]
+name = "gigatiff-server"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+clap = { workspace = true, features = ["derive"] }
+gigatiff-core = { path = "../gigatiff-core" }
+image = { workspace = true, default-features = false, features = ["jpeg", "png", "webp"] }
+percent-encoding.workspace = true
+png.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync"] }
+tower-http = { workspace = true, features = ["cors", "trace"] }
+
+[dev-dependencies]
+tiff.workspace = true

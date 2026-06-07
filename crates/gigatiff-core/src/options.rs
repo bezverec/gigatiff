@@ -1,14 +1,14 @@
 use clap::ValueEnum;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ValueEnum)]
-pub(crate) enum Backend {
+pub enum Backend {
     Auto,
     Libtiff,
     Rust,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub(crate) enum PngCompression {
+pub enum PngCompression {
     None,
     Fastest,
     Fast,
@@ -17,7 +17,7 @@ pub(crate) enum PngCompression {
 }
 
 impl PngCompression {
-    pub(crate) fn to_png(self) -> png::Compression {
+    pub fn to_png(self) -> png::Compression {
         match self {
             Self::None => png::Compression::NoCompression,
             Self::Fastest => png::Compression::Fastest,

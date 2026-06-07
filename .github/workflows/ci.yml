@@ -101,7 +101,7 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Test server-only build
-        run: cargo test --locked --no-default-features --features server --lib --bin gigatiff-server
+        run: cargo test --locked -p gigatiff-server --lib --bin gigatiff-server
 
       - name: Generate IIIF smoke fixture
         shell: pwsh
@@ -110,7 +110,7 @@ jobs:
       - name: Start compose stack
         env:
           GIGATIFF_BUILD_GROK: "0"
-          GIGATIFF_SERVER_FEATURES: server
+          GIGATIFF_SERVER_FEATURES: ""
         run: docker compose up -d --build
 
       - name: Wait for IIIF server

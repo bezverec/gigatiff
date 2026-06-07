@@ -28,9 +28,11 @@ use tokio::sync::Semaphore;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
-use crate::core::render::{PreviewBitmap, Rect, RenderStats, clamp_rect, render_preview};
-use crate::core::tiff_info::{ImageInfo, load_info};
-use crate::options::{Backend, PngCompression};
+use gigatiff_core::options::{Backend, PngCompression};
+#[cfg(feature = "jpeg2000-grok")]
+use gigatiff_core::render::{PreviewBitmap, RenderStats};
+use gigatiff_core::render::{Rect, clamp_rect, render_preview};
+use gigatiff_core::tiff_info::{ImageInfo, load_info};
 
 const ID_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b' ')
@@ -1743,7 +1745,7 @@ fn render_jpeg2000_grok_ffi_preview(
     out_height: u32,
 ) -> Result<PreviewBitmap> {
     let total_start = Instant::now();
-    let ffi = crate::core::grok_ffi::render_region(path, rect, out_width, out_height)?;
+    let ffi = gigatiff_core::grok_ffi::render_region(path, rect, out_width, out_height)?;
     let convert_start = Instant::now();
     let rgba = if ffi.width == out_width && ffi.height == out_height {
         ffi.rgba
