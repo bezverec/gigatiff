@@ -3,7 +3,7 @@ use std::ffi::CString;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::os::raw::{c_char, c_int, c_uint, c_ushort, c_void};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -13,7 +13,7 @@ use rayon::prelude::*;
 use tiff::ColorType;
 use tiff::decoder::{ChunkType, Decoder, DecodingResult};
 
-use crate::core::cache::{OverviewCacheKey, ScanlineCache, ScanlineKey};
+use crate::core::cache::{ScanlineCache, ScanlineKey};
 use crate::core::color::{
     ColorTransform, bits_for_color, samples_for_color, write_sampled_row_rgba,
 };
@@ -97,37 +97,6 @@ impl SamplingPlan {
             src_x_byte_offsets,
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct PreviewRequest {
-    pub(crate) path: PathBuf,
-    pub(crate) rect: Rect,
-    pub(crate) max_output: u32,
-    pub(crate) backend: Backend,
-}
-
-#[derive(Debug)]
-pub(crate) struct RenderJob {
-    pub(crate) request: PreviewRequest,
-    pub(crate) info: ImageInfo,
-    pub(crate) max_chunk_mb: usize,
-    pub(crate) generation: u64,
-    pub(crate) kind: RenderJobKind,
-}
-
-#[derive(Debug)]
-pub(crate) struct RenderResult {
-    pub(crate) request: PreviewRequest,
-    pub(crate) generation: u64,
-    pub(crate) kind: RenderJobKind,
-    pub(crate) result: Result<PreviewBitmap>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum RenderJobKind {
-    Tile,
-    Overview(OverviewCacheKey),
 }
 
 pub(crate) struct RenderCancel {

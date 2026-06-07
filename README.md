@@ -373,15 +373,17 @@ portability step after CI confirms the project compiles on all three platforms.
 
 Shared image handling lives in `src/core/`:
 
-- `cache.rs` contains scanline/tile/overview cache primitives,
+- `cache.rs` contains shared scanline cache primitives,
 - `color.rs` contains color conversion and fast-path row sampling,
 - `render.rs` contains preview rendering, sampling, and PNG export,
 - `tiff_info.rs` contains TIFF metadata loading and decoder helpers,
 - `grok_ffi.rs` contains the optional Grok JPEG2000 FFI backend.
 
-The desktop UI remains in `src/gui.rs`, the command-line desktop entry point in `src/cli.rs`, and
-the IIIF image server in `src/server.rs`. This keeps the current repository unified while making the
-future workspace split into core, desktop, and server crates less disruptive.
+The desktop UI remains in `src/gui.rs`, with desktop-only tile/overview cache code in
+`src/gui/cache.rs` and GUI render queue types in `src/gui/render_queue.rs`. The command-line desktop
+entry point remains in `src/cli.rs`, and the IIIF image server remains in `src/server.rs`. This keeps
+the current repository unified while making the future workspace split into core, desktop, and server
+crates less disruptive.
 
 ## Current Crates
 
