@@ -536,12 +536,43 @@ async fn iiif_info(state: Arc<AppState>, headers: HeaderMap, id: String) -> Resp
             "application/ld+json;profile=\"http://iiif.io/api/image/3/context.json\"",
         ),
     );
-    response.headers_mut().insert(
-        CACHE_CONTROL,
-        HeaderValue::from_static("public, max-age=60"),
-    );
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    insert_jpeg2000_info_headers(response.headers_mut(), &info);
     insert_profile_link_header(response.headers_mut());
     response
+}
+
+#[cfg(feature = "jpeg2000-grok")]
+fn insert_jpeg2000_info_headers(headers: &mut HeaderMap, info: &ServerImageInfo) {
+    let ServerImageSource::Jpeg2000(jpeg2000) = &info.source else {
+        return;
+    };
+
+    insert_optional_u32_header(headers, "x-gigatiff-jp2-precision", jpeg2000.precision);
+    insert_optional_u32_header(headers, "x-gigatiff-jp2-tile-width", jpeg2000.tile_width);
+    insert_optional_u32_header(headers, "x-gigatiff-jp2-tile-height", jpeg2000.tile_height);
+    headers.insert(
+        "x-gigatiff-jp2-tiles-supported",
+        HeaderValue::from_static(if jpeg2000_supports_region_tiles(jpeg2000) {
+            "true"
+        } else {
+            "false"
+        }),
+    );
+}
+
+#[cfg(not(feature = "jpeg2000-grok"))]
+fn insert_jpeg2000_info_headers(_headers: &mut HeaderMap, _info: &ServerImageInfo) {}
+
+#[cfg(feature = "jpeg2000-grok")]
+fn insert_optional_u32_header(headers: &mut HeaderMap, name: &'static str, value: Option<u32>) {
+    if let Some(value) = value {
+        if let Ok(value) = HeaderValue::from_str(&value.to_string()) {
+            headers.insert(name, value);
+        }
+    }
 }
 
 async fn iiif_image(
@@ -785,7 +816,7 @@ fn response_cache_path(
         .unwrap_or_else(|_| image_path.to_path_buf());
 
     let mut hash = Fnv1a64::new();
-    hash.write_bytes(b"gigatiff-server-response-v3");
+    hash.write_bytes(b"gigatiff-server-response-v5");
     hash.write_bytes(canonical.to_string_lossy().as_bytes());
     hash.write_u64(metadata.len());
     hash.write_u64(modified.as_secs());
@@ -804,6 +835,7 @@ fn response_cache_path(
             hash.write_u64(jpeg2000_info.precision.unwrap_or_default() as u64);
             hash.write_u64(jpeg2000_info.tile_width.unwrap_or_default() as u64);
             hash.write_u64(jpeg2000_info.tile_height.unwrap_or_default() as u64);
+            hash.write_u64(u64::from(jpeg2000_supports_region_tiles(jpeg2000_info)));
         }
     }
     hash.write_u64(out_width as u64);
@@ -1646,6 +1678,14 @@ fn load_jpeg2000_info(path: &Path) -> Result<ServerImageInfo> {
 }
 
 #[cfg(feature = "jpeg2000-grok")]
+fn jpeg2000_supports_region_tiles(info: &Jpeg2000Info) -> bool {
+    let has_small_tiles =
+        info.tile_width.unwrap_or_default() < 4096 && info.tile_height.unwrap_or_default() < 4096;
+    let has_high_precision = info.precision.unwrap_or_default() >= 16;
+    has_small_tiles || has_high_precision
+}
+
+#[cfg(feature = "jpeg2000-grok")]
 fn render_jpeg2000_grok_preview(
     path: &Path,
     rect: Rect,
@@ -2187,10 +2227,7 @@ fn should_advertise_tiles(info: &ServerImageInfo) -> bool {
     match &info.source {
         ServerImageSource::Tiff(_) => true,
         #[cfg(feature = "jpeg2000-grok")]
-        ServerImageSource::Jpeg2000(jpeg2000) => {
-            jpeg2000.tile_width.unwrap_or_default() < 4096
-                && jpeg2000.tile_height.unwrap_or_default() < 4096
-        }
+        ServerImageSource::Jpeg2000(jpeg2000) => jpeg2000_supports_region_tiles(jpeg2000),
     }
 }
 
@@ -2738,13 +2775,14 @@ mod tests {
 
     #[cfg(feature = "jpeg2000-grok")]
     #[test]
-    fn large_jpeg2000_tiles_disable_iiif_tile_advertisement() {
+    fn jpeg2000_metadata_controls_iiif_tile_advertisement() {
         let info = ServerImageInfo {
             width: 4096,
             height: 2048,
             source: ServerImageSource::Jpeg2000(Jpeg2000Info {
                 tile_width: Some(4096),
                 tile_height: Some(4096),
+                precision: Some(8),
                 ..Jpeg2000Info::default()
             }),
         };
@@ -2756,10 +2794,34 @@ mod tests {
             source: ServerImageSource::Jpeg2000(Jpeg2000Info {
                 tile_width: Some(1024),
                 tile_height: Some(1024),
+                precision: Some(8),
                 ..Jpeg2000Info::default()
             }),
         };
         assert!(should_advertise_tiles(&info));
+    }
+
+    #[cfg(feature = "jpeg2000-grok")]
+    #[test]
+    fn jpeg2000_region_tile_support_prefers_small_tiles_or_high_precision() {
+        assert!(jpeg2000_supports_region_tiles(&Jpeg2000Info {
+            tile_width: Some(1024),
+            tile_height: Some(1024),
+            precision: Some(8),
+            ..Jpeg2000Info::default()
+        }));
+        assert!(jpeg2000_supports_region_tiles(&Jpeg2000Info {
+            tile_width: Some(4096),
+            tile_height: Some(4096),
+            precision: Some(16),
+            ..Jpeg2000Info::default()
+        }));
+        assert!(!jpeg2000_supports_region_tiles(&Jpeg2000Info {
+            tile_width: Some(4096),
+            tile_height: Some(4096),
+            precision: Some(8),
+            ..Jpeg2000Info::default()
+        }));
     }
 
     #[cfg(feature = "jpeg2000-grok")]
