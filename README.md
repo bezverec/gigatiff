@@ -178,10 +178,9 @@ Grok is AGPL-licensed, so this backend is kept server-only and optional in Cargo
 
 The Docker image enables `jpeg2000-grok-ffi`, which uses the direct Grok FFI backend for normal JP2
 region requests. JP2 files with large codestream tiles, such as the 4096 x 4096 master copies used in
-the local benchmark set, are routed through an OpenJPEG CLI fallback because Grok 20.3.3 produced
-sparse gray-grid artefacts for those region/reduced decode requests. The fallback uses
-`opj_decompress`, which can be overridden with `GIGATIFF_OPENJPEG_DECOMPRESS`. The Docker runtime
-installs Debian's `libopenjp2-tools` package for this path.
+the local benchmark set, are routed through a direct OpenJPEG FFI fallback because Grok 20.3.3
+produced sparse gray-grid artefacts for those region/reduced decode requests. The fallback uses the
+Rust `openjpeg-sys` crate and does not spawn `opj_decompress` or write temporary PNM files.
 
 The server stores encoded IIIF region/tile responses in a persistent cache. By default this is
 `cache/server`; it can be changed with `--cache-dir`. Cached files are keyed by source path, file
@@ -218,6 +217,7 @@ x-gigatiff-render-ms
 x-gigatiff-encode-ms
 x-gigatiff-cache-store-ms
 x-gigatiff-cache-prune-ms
+x-gigatiff-jp2-backend
 ```
 
 The server targets IIIF Image API 3.0 `level2`. It supports `full`/`square`/`x,y,w,h`/
@@ -237,13 +237,29 @@ cargo build --release -p gigatiff-server --bin gigatiff-server
 ```
 
 Use `--features jpeg2000-grok` for TIFF plus JPEG2000 deployments through Grok command-line tools,
-or `--features jpeg2000-grok-ffi` for the direct Grok FFI backend used by the Docker image. The FFI
-Docker path also expects `opj_decompress` to be available for the large-tile JP2 fallback.
+`--features jpeg2000-openjpeg-ffi` for a pure OpenJPEG FFI JPEG2000 backend, or
+`--features jpeg2000-grok-ffi` for the hybrid Docker/server path: Grok FFI for normal JP2 region
+requests and OpenJPEG FFI for large-tile master JP2 files.
+
+JPEG2000 feature builds also expose a runtime backend policy:
+
+```bash
+gigatiff-server --jp2-backend auto
+gigatiff-server --jp2-backend grok
+gigatiff-server --jp2-backend openjpeg
+```
+
+`auto` is the default. In the hybrid `jpeg2000-grok-ffi` build it chooses OpenJPEG FFI for JP2
+codestreams whose tile width or height is at least 4096 px, because those NDK-style master files are
+the cases where Grok 20.3.3 returned sparse gray-grid region output in local testing. Other JP2
+files use Grok FFI because it is faster for the 1024 x 1024 tiled user-copy samples. If an auto
+Grok render fails and OpenJPEG FFI is available, the server retries through OpenJPEG FFI. The actual
+backend used for an IIIF image response is reported in `x-gigatiff-jp2-backend`.
 
 ### Docker and Caddy
 
-The Docker image builds the server package plus the Grok JPEG2000 FFI backend, installs OpenJPEG
-tools for the large-tile JP2 fallback, and expects image files mounted at `/data`:
+The Docker image builds the server package plus the Grok JPEG2000 FFI backend and the OpenJPEG FFI
+fallback, and expects image files mounted at `/data`:
 
 ```bash
 docker build -t gigatiff-server .
@@ -415,6 +431,7 @@ clap    = 4.6.1
 eframe  = 0.34.3
 image   = 0.25.10
 lcms2   = 6.1.1
+openjpeg-sys = 1.0.12
 percent-encoding = 2.3.2
 png     = 0.18.1
 rayon   = 1.12.0
@@ -434,12 +451,9 @@ server-only path.
 The `jpeg2000-grok` feature on `gigatiff-server` does not add Rust crate dependencies; it enables the
 server-side Grok command backend and requires `grk_dump` and `grk_decompress` at runtime. The
 `jpeg2000-grok-ffi` feature additionally enables `gigatiff-core/jpeg2000-grok-ffi` and builds the
-vendored `grokj2k-sys` bindings.
-
-The OpenJPEG fallback for large-tile JP2 masters is also a runtime tool dependency, not a Rust crate
-dependency. The Docker image installs `opj_decompress` from Debian's `libopenjp2-tools`; native
-Linux server deployments that use the FFI path should install the same tool or point
-`GIGATIFF_OPENJPEG_DECOMPRESS` at an equivalent binary.
+vendored `grokj2k-sys` bindings. The `jpeg2000-openjpeg-ffi` feature enables
+`gigatiff-core/jpeg2000-openjpeg-ffi` and builds `openjpeg-sys`; it is used as a standalone JP2
+backend or as the large-tile fallback inside the hybrid `jpeg2000-grok-ffi` server build.
 
 ## Color Management
 
@@ -513,9 +527,10 @@ ordinary JP2 region requests to avoid process spawning and temporary PNM files.
 
 Large-tile JP2 master copies are a special case. Grok 20.3.3 can report successful region/reduced
 decodes for 4096 x 4096 tiled master files while returning sparse gray-grid image data. For those
-sources, the server falls back to OpenJPEG's `opj_decompress`, then applies the same IIIF geometry,
-quality conversion, encoding, and persistent response cache used by TIFF responses. First requests
-for those large master tiles are slower, but warm requests are served from the encoded response cache.
+sources, the hybrid server falls back to the direct OpenJPEG FFI backend, then applies the same IIIF
+geometry, quality conversion, encoding, and persistent response cache used by TIFF responses. First
+requests for those master tiles are slower than TIFF and Grok user-copy JP2 tiles, but warm requests
+are served from the encoded response cache.
 
 ## Benchmarks
 
@@ -668,38 +683,45 @@ mapa2_no_xmp_clean_user_1_8.jp2
 mapa2_user_1_8.jp2             42.2  55.2   58.8  72.1 ms
 ```
 
-After the OpenJPEG fallback was added for 4096 x 4096 tiled master JP2 files, the same master regions
-render as continuous image data instead of sparse gray-grid output. The current Docker/Caddy
-benchmark was run against `http://127.0.0.1:18082` with a purged persistent response cache, JPEG
-output, 512 px output size, three warm iterations, and a parallel batch size of four:
+After the direct OpenJPEG FFI fallback replaced the older `opj_decompress` process fallback for
+4096 x 4096 tiled master JP2 files, the same master regions render as continuous image data without
+spawning an external process or writing temporary PNM files. The local benchmark below used a Windows
+release build with `RUSTFLAGS="-C target-cpu=native"` and the standalone
+`jpeg2000-openjpeg-ffi` feature. It ran against `http://127.0.0.1:18085` with a purged persistent
+response cache, JPEG output, 512 px output size, three warm iterations, and a parallel batch size of
+four:
 
 ```powershell
-.\scripts\bench-server.ps1 -BaseUrl http://127.0.0.1:18082 `
+.\scripts\bench-server.ps1 -BaseUrl http://127.0.0.1:18085 `
     -ImageIds mapa2_no_xmp_clean.tif,mapa2.tif,mapa2_no_xmp_clean_master.jp2,mapa2_master.jp2,mapa2_no_xmp_clean_user_1_8.jp2,mapa2_user_1_8.jp2 `
     -Formats jpg -RegionSizes 512,4096 -OutputSizes 512 `
     -Iterations 3 -Parallel 4 -PurgeServerCache `
-    -OutDir target\server-benchmarks
+    -OutDir target\server-benchmarks-openjpeg-ffi
 ```
 
 ```text
 image                            region  cold render  cold total  warm avg  bytes
-mapa2_no_xmp_clean.tif              512      53.8 ms     88.7 ms   11.6 ms   41954
-mapa2_no_xmp_clean.tif             4096      74.3 ms     92.7 ms   13.2 ms   96871
-mapa2.tif                           512      90.8 ms    109.2 ms   10.6 ms   39456
-mapa2.tif                          4096     112.0 ms    133.5 ms   14.1 ms  101519
-mapa2_no_xmp_clean_master.jp2       512    1269.4 ms   1295.9 ms   10.5 ms   41954
-mapa2_no_xmp_clean_master.jp2      4096    1077.0 ms   1150.6 ms   11.0 ms   96265
-mapa2_master.jp2                    512    1744.8 ms   1762.0 ms    8.5 ms   39382
-mapa2_master.jp2                   4096    1818.1 ms   1841.3 ms   12.3 ms  101172
-mapa2_no_xmp_clean_user_1_8.jp2     512      42.0 ms     60.7 ms   13.5 ms   40604
-mapa2_no_xmp_clean_user_1_8.jp2    4096      54.9 ms     77.6 ms   10.9 ms   78848
-mapa2_user_1_8.jp2                  512      54.0 ms     73.3 ms   10.7 ms   76327
-mapa2_user_1_8.jp2                 4096      73.1 ms    106.1 ms   10.4 ms   83045
+mapa2_no_xmp_clean.tif              512       2.5 ms      7.5 ms    6.1 ms   41954
+mapa2_no_xmp_clean.tif             4096       3.7 ms      8.9 ms    7.7 ms   96871
+mapa2.tif                           512      11.6 ms     16.4 ms    7.0 ms   39456
+mapa2.tif                          4096      19.5 ms     24.9 ms   11.6 ms  101519
+mapa2_no_xmp_clean_master.jp2       512     131.8 ms    137.4 ms    5.5 ms   41954
+mapa2_no_xmp_clean_master.jp2      4096      96.5 ms    102.0 ms    9.0 ms   96265
+mapa2_master.jp2                    512     205.8 ms    211.3 ms    5.9 ms   41954
+mapa2_master.jp2                   4096     151.7 ms    157.8 ms    6.2 ms   96086
+mapa2_no_xmp_clean_user_1_8.jp2     512     244.4 ms    256.4 ms   11.3 ms   40604
+mapa2_no_xmp_clean_user_1_8.jp2    4096     123.7 ms    128.8 ms    6.6 ms   78851
+mapa2_user_1_8.jp2                  512     194.5 ms    204.7 ms    5.7 ms   41607
+mapa2_user_1_8.jp2                 4096     208.0 ms    213.5 ms    6.0 ms   78850
 ```
 
-The tradeoff is deliberate: large master JP2 cold tiles are slower through OpenJPEG, but correct and
-cacheable. Warm-cache responses stay around 9-14 ms client-side because they come from the encoded
-response cache instead of re-running JPEG2000 decode.
+Compared with the older CLI fallback numbers above, the direct OpenJPEG FFI path is roughly 8-12x
+faster for the large master JP2 cold render phase on this machine. The standalone OpenJPEG backend is
+not intended to replace Grok FFI for all JP2 sources yet: user-copy JP2 tiles are slower here than in
+the hybrid Grok FFI path. The intended server configuration is therefore still hybrid: Grok FFI for
+normal JP2 region requests and OpenJPEG FFI for large-tile masters that Grok renders incorrectly.
+Warm-cache responses stay around 6-12 ms client-side because they come from the encoded response
+cache instead of re-running JPEG2000 decode.
 
 The same 4096 -> 512 request shape was also run across JPEG, PNG, and lossless WebP output formats:
 
@@ -900,12 +922,12 @@ Useful next steps for the image server:
 - keep the Grok FFI backend as the default Docker path and preserve the CLI backend as a fallback
   build feature,
 - add CI coverage for `gigatiff-server --features jpeg2000-grok-ffi` in a Linux container with upstream Grok installed,
-- benchmark the OpenJPEG large-tile JP2 fallback across master files, overview requests, output
-  sizes, and repeated warm-cache OpenSeadragon navigation,
+- benchmark the direct OpenJPEG FFI fallback in the Linux/Docker hybrid build across master files,
+  overview requests, output sizes, and repeated warm-cache OpenSeadragon navigation,
 - investigate whether Grok has a newer region-decode path or parameter set that fixes sparse
   gray-grid output for 4096 x 4096 RPCL master codestreams,
-- evaluate replacing the OpenJPEG CLI fallback with a direct library/FFI path if it becomes a hot
-  production path,
+- tune the direct OpenJPEG FFI path, especially reduction choice, component conversion, and
+  concurrent region decode behavior,
 - investigate why lower-rate JP2 user-copy region requests are slower through FFI than through the
   CLI backend, especially around Grok reduction/update behavior and component copy cost,
 - benchmark full-image JP2 thumbnails separately from tile/region requests and tune reduction

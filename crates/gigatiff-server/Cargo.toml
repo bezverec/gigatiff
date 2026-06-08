@@ -8,7 +8,12 @@ repository.workspace = true
 [features]
 default = []
 jpeg2000-grok = []
-jpeg2000-grok-ffi = ["jpeg2000-grok", "gigatiff-core/jpeg2000-grok-ffi"]
+jpeg2000-openjpeg-ffi = ["gigatiff-core/jpeg2000-openjpeg-ffi"]
+jpeg2000-grok-ffi = [
+    "jpeg2000-grok",
+    "jpeg2000-openjpeg-ffi",
+    "gigatiff-core/jpeg2000-grok-ffi",
+]
 
 [[bin]]
 name = "gigatiff-server"

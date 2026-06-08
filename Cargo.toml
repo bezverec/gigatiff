@@ -21,6 +21,7 @@ eframe = "0.34.3"
 grokj2k-sys = { path = "vendor/grokj2k-sys" }
 image = { version = "0.25.10", default-features = false }
 lcms2 = "6.1.1"
+openjpeg-sys = "1.0.12"
 percent-encoding = "2.3.2"
 png = "0.18.1"
 rayon = "1.12.0"

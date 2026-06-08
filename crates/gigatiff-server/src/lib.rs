@@ -17,7 +17,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use image::ExtendedColorType;
 use image::ImageEncoder;
 use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
@@ -29,7 +29,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 use gigatiff_core::options::{Backend, PngCompression};
-#[cfg(feature = "jpeg2000-grok")]
+#[cfg(any(feature = "jpeg2000-grok", feature = "jpeg2000-openjpeg-ffi"))]
 use gigatiff_core::render::{PreviewBitmap, RenderStats};
 use gigatiff_core::render::{Rect, clamp_rect, render_preview};
 use gigatiff_core::tiff_info::{ImageInfo, load_info};
@@ -83,6 +83,10 @@ struct ServerCli {
     #[arg(long, value_enum, default_value_t = Backend::Auto)]
     backend: Backend,
 
+    /// JPEG2000 backend policy.
+    #[arg(long, value_enum, default_value_t = Jp2BackendPolicy::Auto)]
+    jp2_backend: Jp2BackendPolicy,
+
     /// Directory for persistent encoded IIIF region/tile responses.
     #[arg(long, default_value = "cache/server")]
     cache_dir: PathBuf,
@@ -108,6 +112,7 @@ struct AppState {
     max_chunk_mb: usize,
     quality: u8,
     backend: Backend,
+    jp2_backend: Jp2BackendPolicy,
     cache_dir: Arc<PathBuf>,
     cache_max_bytes: u64,
     cache_prune_interval: Duration,
@@ -115,6 +120,39 @@ struct AppState {
     last_cache_prune_report: Arc<Mutex<CachePruneReport>>,
     render_permits: Arc<Semaphore>,
     info_cache: Arc<Mutex<HashMap<PathBuf, Arc<ServerImageInfo>>>>,
+}
+
+#[cfg(any(feature = "jpeg2000-grok", feature = "jpeg2000-openjpeg-ffi"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum Jp2BackendPolicy {
+    Auto,
+    Grok,
+    Openjpeg,
+}
+
+#[cfg(not(any(feature = "jpeg2000-grok", feature = "jpeg2000-openjpeg-ffi")))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum Jp2BackendPolicy {
+    Auto,
+}
+
+impl Default for Jp2BackendPolicy {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+impl Jp2BackendPolicy {
+    #[cfg(any(feature = "jpeg2000-grok", feature = "jpeg2000-openjpeg-ffi"))]
+    fn cache_label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            #[cfg(any(feature = "jpeg2000-grok", feature = "jpeg2000-openjpeg-ffi"))]
+            Self::Grok => "grok",
+            #[cfg(any(feature = "jpeg2000-grok", feature = "jpeg2000-openjpeg-ffi"))]
+            Self::Openjpeg => "openjpeg",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -136,8 +174,8 @@ impl ServerImageInfo {
     fn source_label(&self) -> &'static str {
         match &self.source {
             ServerImageSource::Tiff(_) => "tiff",
-            #[cfg(feature = "jpeg2000-grok")]
-            ServerImageSource::Jpeg2000(_) => "jpeg2000-grok",
+            #[cfg(any(feature = "jpeg2000-grok", feature = "jpeg2000-openjpeg-ffi"))]
+            ServerImageSource::Jpeg2000(_) => "jpeg2000",
         }
     }
 }
@@ -145,17 +183,35 @@ impl ServerImageInfo {
 #[derive(Debug, Clone)]
 enum ServerImageSource {
     Tiff(ImageInfo),
-    #[cfg(feature = "jpeg2000-grok")]
+    #[cfg(any(feature = "jpeg2000-grok", feature = "jpeg2000-openjpeg-ffi"))]
     Jpeg2000(Jpeg2000Info),
 }
 
-#[cfg(feature = "jpeg2000-grok")]
+#[cfg(any(feature = "jpeg2000-grok", feature = "jpeg2000-openjpeg-ffi"))]
 #[derive(Debug, Clone, Copy, Default)]
 struct Jpeg2000Info {
     components: Option<u32>,
     precision: Option<u32>,
     tile_width: Option<u32>,
     tile_height: Option<u32>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Jp2RenderBackend {
+    GrokCli,
+    GrokFfi,
+    OpenJpegFfi,
+}
+
+impl Jp2RenderBackend {
+    fn label(self) -> &'static str {
+        match self {
+            Self::GrokCli => "grok-cli",
+            Self::GrokFfi => "grok-ffi",
+            Self::OpenJpegFfi => "openjpeg-ffi",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -251,6 +307,7 @@ pub async fn run_from_cli() -> Result<()> {
         max_chunk_mb: cli.max_chunk_mb,
         quality: cli.quality,
         backend: cli.backend,
+        jp2_backend: cli.jp2_backend,
         cache_dir: Arc::new(cache_dir),
         cache_max_bytes: cli.cache_max_mb.saturating_mul(1024 * 1024),
         cache_prune_interval: Duration::from_secs(cli.cache_prune_interval_sec),
@@ -544,7 +601,7 @@ async fn iiif_info(state: Arc<AppState>, headers: HeaderMap, id: String) -> Resp
     response
 }
 
-#[cfg(feature = "jpeg2000-grok")]
+#[cfg(any(feature = "jpeg2000-grok", feature = "jpeg2000-openjpeg-ffi"))]
 fn insert_jpeg2000_info_headers(headers: &mut HeaderMap, info: &ServerImageInfo) {
     let ServerImageSource::Jpeg2000(jpeg2000) = &info.source else {
         return;
@@ -563,10 +620,10 @@ fn insert_jpeg2000_info_headers(headers: &mut HeaderMap, info: &ServerImageInfo)
     );
 }
 
-#[cfg(not(feature = "jpeg2000-grok"))]
+#[cfg(not(any(feature = "jpeg2000-grok", feature = "jpeg2000-openjpeg-ffi")))]
 fn insert_jpeg2000_info_headers(_headers: &mut HeaderMap, _info: &ServerImageInfo) {}
 
-#[cfg(feature = "jpeg2000-grok")]
+#[cfg(any(feature = "jpeg2000-grok", feature = "jpeg2000-openjpeg-ffi"))]
 fn insert_optional_u32_header(headers: &mut HeaderMap, name: &'static str, value: Option<u32>) {
     if let Some(value) = value {
         if let Ok(value) = HeaderValue::from_str(&value.to_string()) {
@@ -609,6 +666,12 @@ async fn iiif_image(
                 "x-gigatiff-cache",
                 HeaderValue::from_static(rendered.cache_status),
             );
+            if let Some(jp2_backend) = rendered.jp2_backend {
+                response.headers_mut().insert(
+                    "x-gigatiff-jp2-backend",
+                    HeaderValue::from_static(jp2_backend),
+                );
+            }
             insert_ms_header(
                 response.headers_mut(),
                 "x-gigatiff-total-ms",
@@ -659,6 +722,7 @@ struct RenderedResponse {
     cache_status: &'static str,
     canonical_path: String,
     timing: ResponseTiming,
+    jp2_backend: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -706,6 +770,10 @@ fn render_iiif_image(
         );
     }
 
+    let jp2_backend = select_jp2_backend(state, &info)?;
+    let jp2_fallback_cache_backend =
+        jp2_backend.and_then(|backend| fallback_cache_backend(state.jp2_backend, backend));
+
     let cache_path = if state.cache_max_bytes > 0 {
         let path = response_cache_path(
             &state.cache_dir,
@@ -715,6 +783,7 @@ fn render_iiif_image(
             out_width,
             out_height,
             state,
+            jp2_backend,
         )?;
         let cache_read_start = Instant::now();
         if let Ok(bytes) = fs::read(&path) {
@@ -726,7 +795,32 @@ fn render_iiif_image(
                 cache_status: "hit",
                 canonical_path,
                 timing,
+                jp2_backend: jp2_backend.map(Jp2RenderBackend::label),
             });
+        }
+        if let Some(fallback_backend) = jp2_fallback_cache_backend {
+            let fallback_path = response_cache_path(
+                &state.cache_dir,
+                &image_path,
+                &info,
+                &canonical_path,
+                out_width,
+                out_height,
+                state,
+                Some(fallback_backend),
+            )?;
+            if let Ok(bytes) = fs::read(&fallback_path) {
+                timing.cache_read = cache_read_start.elapsed();
+                timing.total = total_start.elapsed();
+                return Ok(RenderedResponse {
+                    bytes,
+                    content_type: content_type(&request.format),
+                    cache_status: "hit",
+                    canonical_path,
+                    timing,
+                    jp2_backend: Some(fallback_backend.label()),
+                });
+            }
         }
         timing.cache_read = cache_read_start.elapsed();
         Some(path)
@@ -735,21 +829,30 @@ fn render_iiif_image(
     };
 
     let render_start = Instant::now();
-    let preview = match &info.source {
-        ServerImageSource::Tiff(tiff_info) => render_preview(
+    let (preview, actual_jp2_backend) = match &info.source {
+        ServerImageSource::Tiff(tiff_info) => (
+            render_preview(
+                &image_path,
+                tiff_info,
+                rect,
+                out_width.max(out_height),
+                state.max_chunk_mb,
+                state.backend,
+                None,
+                None,
+            )?,
+            None,
+        ),
+        #[cfg(any(feature = "jpeg2000-grok", feature = "jpeg2000-openjpeg-ffi"))]
+        ServerImageSource::Jpeg2000(jpeg2000_info) => render_jpeg2000_preview(
             &image_path,
-            tiff_info,
+            jpeg2000_info,
             rect,
-            out_width.max(out_height),
-            state.max_chunk_mb,
-            state.backend,
-            None,
-            None,
+            out_width,
+            out_height,
+            jp2_backend.ok_or_else(|| anyhow!("missing JPEG2000 backend selection"))?,
+            state.jp2_backend == Jp2BackendPolicy::Auto,
         )?,
-        #[cfg(feature = "jpeg2000-grok")]
-        ServerImageSource::Jpeg2000(jpeg2000_info) => {
-            render_jpeg2000_grok_preview(&image_path, jpeg2000_info, rect, out_width, out_height)?
-        }
     };
     timing.render = render_start.elapsed();
     let mut rgba = if preview.width == out_width && preview.height == out_height {
@@ -777,7 +880,21 @@ fn render_iiif_image(
     timing.encode = encode_start.elapsed();
     let cache_status = if let Some(cache_path) = cache_path {
         let store_start = Instant::now();
-        store_cached_response(&cache_path, &bytes)?;
+        let actual_cache_path = if actual_jp2_backend != jp2_backend {
+            response_cache_path(
+                &state.cache_dir,
+                &image_path,
+                &info,
+                &canonical_path,
+                out_width,
+                out_height,
+                state,
+                actual_jp2_backend,
+            )?
+        } else {
+            cache_path
+        };
+        store_cached_response(&actual_cache_path, &bytes)?;
         timing.cache_store = store_start.elapsed();
         let prune_start = Instant::now();
         prune_response_cache_throttled(state)?;
@@ -793,6 +910,7 @@ fn render_iiif_image(
         cache_status,
         canonical_path,
         timing,
+        jp2_backend: actual_jp2_backend.map(Jp2RenderBackend::label),
     })
 }
 
@@ -804,7 +922,9 @@ fn response_cache_path(
     out_width: u32,
     out_height: u32,
     state: &AppState,
+    jp2_backend: Option<Jp2RenderBackend>,
 ) -> Result<PathBuf> {
+    let _ = jp2_backend;
     let metadata = fs::metadata(image_path)?;
     let modified = metadata
         .modified()
@@ -816,7 +936,7 @@ fn response_cache_path(
         .unwrap_or_else(|_| image_path.to_path_buf());
 
     let mut hash = Fnv1a64::new();
-    hash.write_bytes(b"gigatiff-server-response-v6");
+    hash.write_bytes(b"gigatiff-server-response-v8");
     hash.write_bytes(canonical.to_string_lossy().as_bytes());
     hash.write_u64(metadata.len());
     hash.write_u64(modified.as_secs());
@@ -829,7 +949,7 @@ fn response_cache_path(
             hash.write_u64(tiff_info.chunk_width as u64);
             hash.write_u64(tiff_info.chunk_height as u64);
         }
-        #[cfg(feature = "jpeg2000-grok")]
+        #[cfg(any(feature = "jpeg2000-grok", feature = "jpeg2000-openjpeg-ffi"))]
         ServerImageSource::Jpeg2000(jpeg2000_info) => {
             hash.write_u64(jpeg2000_info.components.unwrap_or_default() as u64);
             hash.write_u64(jpeg2000_info.precision.unwrap_or_default() as u64);
@@ -837,6 +957,13 @@ fn response_cache_path(
             hash.write_u64(jpeg2000_info.tile_height.unwrap_or_default() as u64);
             hash.write_u64(u64::from(jpeg2000_supports_region_tiles(jpeg2000_info)));
             hash.write_u64(u64::from(should_use_openjpeg_fallback(jpeg2000_info)));
+            hash.write_bytes(state.jp2_backend.cache_label().as_bytes());
+            hash.write_bytes(
+                jp2_backend
+                    .map(Jp2RenderBackend::label)
+                    .unwrap_or("none")
+                    .as_bytes(),
+            );
         }
     }
     hash.write_u64(out_width as u64);
@@ -1648,44 +1775,162 @@ fn resize_nearest_rgba(
     resized
 }
 
-#[cfg(feature = "jpeg2000-grok")]
+#[cfg(any(feature = "jpeg2000-grok", feature = "jpeg2000-openjpeg-ffi"))]
 fn load_jpeg2000_info(path: &Path) -> Result<ServerImageInfo> {
-    let output = Command::new(grok_dump_command())
-        .arg("-i")
-        .arg(path)
-        .output()
-        .with_context(|| "running grk_dump for JPEG2000 metadata")?;
+    #[cfg(feature = "jpeg2000-grok")]
+    {
+        let output = Command::new(grok_dump_command())
+            .arg("-i")
+            .arg(path)
+            .output()
+            .with_context(|| "running grk_dump for JPEG2000 metadata")?;
 
-    if !output.status.success() {
-        bail!(
-            "grk_dump failed for {}: {}",
-            path.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+        if !output.status.success() {
+            bail!(
+                "grk_dump failed for {}: {}",
+                path.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+
+        let mut dump = String::from_utf8_lossy(&output.stdout).to_string();
+        if !output.stderr.is_empty() {
+            dump.push('\n');
+            dump.push_str(&String::from_utf8_lossy(&output.stderr));
+        }
+
+        let info = parse_grok_dump_info(&dump)?;
+        return Ok(ServerImageInfo {
+            width: info.width,
+            height: info.height,
+            source: ServerImageSource::Jpeg2000(info.jpeg2000),
+        });
     }
 
-    let mut dump = String::from_utf8_lossy(&output.stdout).to_string();
-    if !output.stderr.is_empty() {
-        dump.push('\n');
-        dump.push_str(&String::from_utf8_lossy(&output.stderr));
+    #[cfg(all(not(feature = "jpeg2000-grok"), feature = "jpeg2000-openjpeg-ffi"))]
+    {
+        let info = gigatiff_core::openjpeg_ffi::read_info(path)?;
+        let precision = info.components.first().map(|component| component.precision);
+        return Ok(ServerImageInfo {
+            width: info.width,
+            height: info.height,
+            source: ServerImageSource::Jpeg2000(Jpeg2000Info {
+                components: Some(info.components.len() as u32),
+                precision,
+                tile_width: None,
+                tile_height: None,
+            }),
+        });
     }
-
-    let info = parse_grok_dump_info(&dump)?;
-    Ok(ServerImageInfo {
-        width: info.width,
-        height: info.height,
-        source: ServerImageSource::Jpeg2000(info.jpeg2000),
-    })
 }
 
-#[cfg(feature = "jpeg2000-grok")]
-fn jpeg2000_supports_region_tiles(info: &Jpeg2000Info) -> bool {
+#[cfg(any(feature = "jpeg2000-grok", feature = "jpeg2000-openjpeg-ffi"))]
+fn select_jp2_backend(
+    state: &AppState,
+    info: &ServerImageInfo,
+) -> Result<Option<Jp2RenderBackend>> {
+    let ServerImageSource::Jpeg2000(jpeg2000) = &info.source else {
+        return Ok(None);
+    };
+
+    match state.jp2_backend {
+        Jp2BackendPolicy::Auto => {
+            if should_use_openjpeg_fallback(jpeg2000) {
+                return openjpeg_backend()
+                    .ok_or_else(|| {
+                        anyhow!("JPEG2000 auto selected OpenJPEG, but it is not enabled")
+                    })
+                    .map(Some);
+            }
+            grok_backend()
+                .or_else(openjpeg_backend)
+                .ok_or_else(|| anyhow!("no JPEG2000 backend is enabled"))
+                .map(Some)
+        }
+        #[cfg(any(feature = "jpeg2000-grok", feature = "jpeg2000-openjpeg-ffi"))]
+        Jp2BackendPolicy::Grok => grok_backend()
+            .ok_or_else(|| anyhow!("--jp2-backend grok requires a Grok JPEG2000 feature"))
+            .map(Some),
+        #[cfg(any(feature = "jpeg2000-grok", feature = "jpeg2000-openjpeg-ffi"))]
+        Jp2BackendPolicy::Openjpeg => openjpeg_backend()
+            .ok_or_else(|| anyhow!("--jp2-backend openjpeg requires jpeg2000-openjpeg-ffi"))
+            .map(Some),
+    }
+}
+
+#[cfg(not(any(feature = "jpeg2000-grok", feature = "jpeg2000-openjpeg-ffi")))]
+fn select_jp2_backend(
+    _state: &AppState,
+    _info: &ServerImageInfo,
+) -> Result<Option<Jp2RenderBackend>> {
+    Ok(None)
+}
+
+#[cfg(any(feature = "jpeg2000-grok", feature = "jpeg2000-openjpeg-ffi"))]
+fn grok_backend() -> Option<Jp2RenderBackend> {
     #[cfg(feature = "jpeg2000-grok-ffi")]
+    {
+        return Some(Jp2RenderBackend::GrokFfi);
+    }
+
+    #[cfg(all(not(feature = "jpeg2000-grok-ffi"), feature = "jpeg2000-grok"))]
+    {
+        return Some(Jp2RenderBackend::GrokCli);
+    }
+
+    #[cfg(not(feature = "jpeg2000-grok"))]
+    {
+        None
+    }
+}
+
+fn openjpeg_backend() -> Option<Jp2RenderBackend> {
+    #[cfg(feature = "jpeg2000-openjpeg-ffi")]
+    {
+        return Some(Jp2RenderBackend::OpenJpegFfi);
+    }
+
+    #[cfg(not(feature = "jpeg2000-openjpeg-ffi"))]
+    {
+        None
+    }
+}
+
+fn fallback_cache_backend(
+    policy: Jp2BackendPolicy,
+    backend: Jp2RenderBackend,
+) -> Option<Jp2RenderBackend> {
+    if policy == Jp2BackendPolicy::Auto && is_grok_backend(backend) {
+        openjpeg_backend()
+    } else {
+        None
+    }
+}
+
+fn is_grok_backend(backend: Jp2RenderBackend) -> bool {
+    matches!(
+        backend,
+        Jp2RenderBackend::GrokCli | Jp2RenderBackend::GrokFfi
+    )
+}
+
+#[cfg(any(feature = "jpeg2000-grok", feature = "jpeg2000-openjpeg-ffi"))]
+fn jpeg2000_supports_region_tiles(info: &Jpeg2000Info) -> bool {
+    #[cfg(feature = "jpeg2000-openjpeg-ffi")]
+    {
+        let _ = info;
+        return true;
+    }
+
+    #[cfg(all(not(feature = "jpeg2000-openjpeg-ffi"), feature = "jpeg2000-grok-ffi"))]
     {
         return info.tile_width.is_some() && info.tile_height.is_some();
     }
 
-    #[cfg(not(feature = "jpeg2000-grok-ffi"))]
+    #[cfg(all(
+        not(feature = "jpeg2000-openjpeg-ffi"),
+        not(feature = "jpeg2000-grok-ffi")
+    ))]
     {
         let has_small_tiles = info.tile_width.unwrap_or_default() < 4096
             && info.tile_height.unwrap_or_default() < 4096;
@@ -1694,27 +1939,43 @@ fn jpeg2000_supports_region_tiles(info: &Jpeg2000Info) -> bool {
     }
 }
 
-#[cfg(feature = "jpeg2000-grok")]
-fn render_jpeg2000_grok_preview(
+#[cfg(any(feature = "jpeg2000-grok", feature = "jpeg2000-openjpeg-ffi"))]
+fn render_jpeg2000_preview(
     path: &Path,
     info: &Jpeg2000Info,
     rect: Rect,
     out_width: u32,
     out_height: u32,
-) -> Result<PreviewBitmap> {
-    #[cfg(feature = "jpeg2000-grok-ffi")]
-    {
-        if should_use_large_tile_jpeg2000_fallback(info) {
-            return render_jpeg2000_openjpeg_preview(path, rect, out_width, out_height)
-                .with_context(|| "rendering large-tile JPEG2000 through OpenJPEG fallback");
+    backend: Jp2RenderBackend,
+    allow_grok_fallback: bool,
+) -> Result<(PreviewBitmap, Option<Jp2RenderBackend>)> {
+    let _ = info;
+    let render = match backend {
+        Jp2RenderBackend::GrokCli => {
+            render_jpeg2000_grok_cli_preview(path, rect, out_width, out_height)
+                .with_context(|| "rendering JPEG2000 through Grok CLI")
         }
-        return render_jpeg2000_grok_ffi_preview(path, rect, out_width, out_height)
-            .with_context(|| "rendering JPEG2000 through Grok FFI");
-    }
-    #[cfg(not(feature = "jpeg2000-grok-ffi"))]
-    {
-        let _ = info;
-        render_jpeg2000_grok_cli_preview(path, rect, out_width, out_height)
+        Jp2RenderBackend::GrokFfi => {
+            render_jpeg2000_grok_ffi_preview(path, rect, out_width, out_height)
+                .with_context(|| "rendering JPEG2000 through Grok FFI")
+        }
+        Jp2RenderBackend::OpenJpegFfi => {
+            render_jpeg2000_openjpeg_preview(path, rect, out_width, out_height)
+                .with_context(|| "rendering JPEG2000 through OpenJPEG FFI")
+        }
+    };
+
+    match render {
+        Ok(bitmap) => Ok((bitmap, Some(backend))),
+        Err(err) if allow_grok_fallback && is_grok_backend(backend) => {
+            let Some(fallback) = openjpeg_backend() else {
+                return Err(err);
+            };
+            let bitmap = render_jpeg2000_openjpeg_preview(path, rect, out_width, out_height)
+                .with_context(|| format!("{err}; fallback to OpenJPEG FFI also failed"))?;
+            Ok((bitmap, Some(fallback)))
+        }
+        Err(err) => Err(err),
     }
 }
 
@@ -1799,6 +2060,19 @@ fn render_jpeg2000_grok_cli_preview(
     })
 }
 
+#[cfg(all(
+    any(feature = "jpeg2000-grok", feature = "jpeg2000-openjpeg-ffi"),
+    not(all(feature = "jpeg2000-grok", not(feature = "jpeg2000-grok-ffi")))
+))]
+fn render_jpeg2000_grok_cli_preview(
+    _path: &Path,
+    _rect: Rect,
+    _out_width: u32,
+    _out_height: u32,
+) -> Result<PreviewBitmap> {
+    bail!("Grok CLI JPEG2000 backend is not enabled")
+}
+
 #[cfg(feature = "jpeg2000-grok-ffi")]
 fn render_jpeg2000_grok_ffi_preview(
     path: &Path,
@@ -1832,17 +2106,25 @@ fn render_jpeg2000_grok_ffi_preview(
     })
 }
 
-#[cfg(feature = "jpeg2000-grok-ffi")]
-fn should_use_large_tile_jpeg2000_fallback(info: &Jpeg2000Info) -> bool {
-    should_use_openjpeg_fallback(info)
+#[cfg(all(
+    any(feature = "jpeg2000-grok", feature = "jpeg2000-openjpeg-ffi"),
+    not(feature = "jpeg2000-grok-ffi")
+))]
+fn render_jpeg2000_grok_ffi_preview(
+    _path: &Path,
+    _rect: Rect,
+    _out_width: u32,
+    _out_height: u32,
+) -> Result<PreviewBitmap> {
+    bail!("Grok FFI JPEG2000 backend is not enabled")
 }
 
-#[cfg(feature = "jpeg2000-grok")]
+#[cfg(any(feature = "jpeg2000-grok", feature = "jpeg2000-openjpeg-ffi"))]
 fn should_use_openjpeg_fallback(info: &Jpeg2000Info) -> bool {
     info.tile_width.unwrap_or_default() >= 4096 || info.tile_height.unwrap_or_default() >= 4096
 }
 
-#[cfg(feature = "jpeg2000-grok-ffi")]
+#[cfg(feature = "jpeg2000-openjpeg-ffi")]
 fn render_jpeg2000_openjpeg_preview(
     path: &Path,
     rect: Rect,
@@ -1850,80 +2132,42 @@ fn render_jpeg2000_openjpeg_preview(
     out_height: u32,
 ) -> Result<PreviewBitmap> {
     let total_start = Instant::now();
-    let temp_path = std::env::temp_dir().join(format!(
-        "gigatiff-openjpeg-{}-{}.ppm",
-        std::process::id(),
-        UNIX_EPOCH.elapsed().unwrap_or_default().as_nanos()
-    ));
-
-    let mut command = Command::new(openjpeg_decompress_command());
-    command
-        .arg("-i")
-        .arg(path)
-        .arg("-o")
-        .arg(&temp_path)
-        .arg("-d")
-        .arg(format!(
-            "{},{},{},{}",
-            rect.x,
-            rect.y,
-            rect.x.saturating_add(rect.width),
-            rect.y.saturating_add(rect.height)
-        ))
-        .arg("-threads")
-        .arg("1")
-        .arg("-force-rgb")
-        .arg("-quiet");
-
-    let reduce = grok_reduce_factor(rect, out_width, out_height);
-    if reduce > 0 {
-        command.arg("-r").arg(reduce.to_string());
-    }
-
-    let decode_start = Instant::now();
-    let output = command
-        .output()
-        .with_context(|| "running opj_decompress for JPEG2000 region")?;
-    let decode = decode_start.elapsed();
-
-    if !output.status.success() {
-        let _ = fs::remove_file(&temp_path);
-        bail!(
-            "opj_decompress failed for {}: {}",
-            path.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-
-    let read_start = Instant::now();
-    let bytes = fs::read(&temp_path)
-        .with_context(|| format!("reading OpenJPEG output {}", temp_path.display()))?;
-    let _ = fs::remove_file(&temp_path);
-    let (decoded_width, decoded_height, rgba) = parse_pnm_rgba(&bytes)?;
-    let read = read_start.elapsed();
-
+    let ffi = gigatiff_core::openjpeg_ffi::render_region(path, rect, out_width, out_height)?;
     let convert_start = Instant::now();
-    let rgba = if decoded_width == out_width && decoded_height == out_height {
-        rgba
+    let rgba = if ffi.width == out_width && ffi.height == out_height {
+        ffi.rgba
     } else {
-        resize_nearest_rgba(&rgba, decoded_width, decoded_height, out_width, out_height)
+        resize_nearest_rgba(&ffi.rgba, ffi.width, ffi.height, out_width, out_height)
     };
-    let convert = convert_start.elapsed();
+    let resize = convert_start.elapsed();
 
     Ok(PreviewBitmap {
         width: out_width,
         height: out_height,
         rgba,
-        source: "openjpeg-jpeg2000",
+        source: "openjpeg-ffi-jpeg2000",
         decoded_chunks: 1,
         stats: RenderStats {
             total: total_start.elapsed(),
-            read,
-            convert,
-            decode,
+            read: Duration::ZERO,
+            convert: ffi.convert + resize,
+            decode: ffi.decode,
             ..RenderStats::default()
         },
     })
+}
+
+#[cfg(all(
+    any(feature = "jpeg2000-grok", feature = "jpeg2000-openjpeg-ffi"),
+    not(feature = "jpeg2000-openjpeg-ffi")
+))]
+fn render_jpeg2000_openjpeg_preview(
+    _path: &Path,
+    _rect: Rect,
+    _out_width: u32,
+    _out_height: u32,
+) -> Result<PreviewBitmap> {
+    bail!("OpenJPEG FFI JPEG2000 backend is not enabled")
 }
 
 #[cfg(feature = "jpeg2000-grok")]
@@ -2129,12 +2373,6 @@ fn grok_decompress_command() -> OsString {
     std::env::var_os("GIGATIFF_GROK_DECOMPRESS").unwrap_or_else(|| OsString::from("grk_decompress"))
 }
 
-#[cfg(feature = "jpeg2000-grok-ffi")]
-fn openjpeg_decompress_command() -> OsString {
-    std::env::var_os("GIGATIFF_OPENJPEG_DECOMPRESS")
-        .unwrap_or_else(|| OsString::from("opj_decompress"))
-}
-
 async fn load_cached_info(state: &AppState, path: &Path) -> Result<Arc<ServerImageInfo>> {
     let state = state.clone();
     let path = path.to_path_buf();
@@ -2169,13 +2407,13 @@ fn load_server_image_info(path: &Path) -> Result<ServerImageInfo> {
     }
 
     if is_jpeg2000_path(path) {
-        #[cfg(feature = "jpeg2000-grok")]
+        #[cfg(any(feature = "jpeg2000-grok", feature = "jpeg2000-openjpeg-ffi"))]
         {
             return load_jpeg2000_info(path);
         }
-        #[cfg(not(feature = "jpeg2000-grok"))]
+        #[cfg(not(any(feature = "jpeg2000-grok", feature = "jpeg2000-openjpeg-ffi")))]
         {
-            bail!("JPEG2000 support requires the jpeg2000-grok Cargo feature");
+            bail!("JPEG2000 support requires a JPEG2000 Cargo feature");
         }
     }
 
@@ -2341,7 +2579,7 @@ fn is_supported_image_path(path: &Path) -> bool {
 fn should_advertise_tiles(info: &ServerImageInfo) -> bool {
     match &info.source {
         ServerImageSource::Tiff(_) => true,
-        #[cfg(feature = "jpeg2000-grok")]
+        #[cfg(any(feature = "jpeg2000-grok", feature = "jpeg2000-openjpeg-ffi"))]
         ServerImageSource::Jpeg2000(jpeg2000) => jpeg2000_supports_region_tiles(jpeg2000),
     }
 }
@@ -2766,6 +3004,7 @@ mod tests {
             full_width,
             full_height,
             &state,
+            None,
         )
         .unwrap();
         let equivalent_path = response_cache_path(
@@ -2776,6 +3015,7 @@ mod tests {
             equivalent_width,
             equivalent_height,
             &state,
+            None,
         )
         .unwrap();
         assert_eq!(full_path, equivalent_path);
@@ -2804,6 +3044,7 @@ mod tests {
             changed_width,
             changed_height,
             &state,
+            None,
         )
         .unwrap();
         assert_ne!(full_path, changed_path);
@@ -2984,6 +3225,7 @@ mod tests {
             max_chunk_mb: 256,
             quality: 85,
             backend: Backend::Auto,
+            jp2_backend: Jp2BackendPolicy::Auto,
             cache_dir: Arc::new(cache_dir),
             cache_max_bytes: 4096 * 1024 * 1024,
             cache_prune_interval: Duration::from_secs(60),

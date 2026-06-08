@@ -9,12 +9,14 @@ build = "build.rs"
 [features]
 default = []
 jpeg2000-grok-ffi = ["dep:grokj2k-sys"]
+jpeg2000-openjpeg-ffi = ["dep:openjpeg-sys"]
 
 [dependencies]
 anyhow.workspace = true
 clap = { workspace = true, features = ["derive"] }
 grokj2k-sys = { workspace = true, optional = true }
 lcms2.workspace = true
+openjpeg-sys = { workspace = true, optional = true }
 png.workspace = true
 rayon.workspace = true
 tiff.workspace = true
