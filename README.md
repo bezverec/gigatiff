@@ -182,34 +182,101 @@ the local benchmark set, are routed through a direct OpenJPEG FFI fallback becau
 produced sparse gray-grid artefacts for those region/reduced decode requests. The fallback uses the
 Rust `openjpeg-sys` crate and does not spawn `opj_decompress` or write temporary PNM files.
 
-The server stores encoded IIIF region/tile responses in a persistent cache. By default this is
-`cache/server`; it can be changed with `--cache-dir`. Cached files are keyed by source path, file
-size, modification time, image dimensions, backend, encoder settings, and the canonical IIIF image
-URI, so equivalent request spellings reuse the same cache entry. The cache is pruned after writes to
-stay under `--cache-max-mb` (default `4096`). Set `--cache-max-mb 0` to disable the persistent
-response cache. Concurrent TIFF render jobs are limited with `--max-concurrent-renders` to avoid
-flooding libtiff with too many simultaneous requests during fast OpenSeadragon pan/zoom interaction.
-Image responses are also browser-cacheable for 24 hours, so after changing decoder behavior or
-purging the server-side cache, use a hard browser reload if old OpenSeadragon tiles remain visible.
+The server stores encoded IIIF region/tile responses in a persistent cache. By default this is the
+local disk backend under `cache/server`; it can be changed with `--cache-dir`. The alternative
+`--cache-backend dragonfly` uses a Redis-compatible Dragonfly server configured through
+`--dragonfly-url` and `--cache-namespace`. Cached responses are keyed by source path, file size,
+modification time, image dimensions, backend, encoder settings, and the canonical IIIF image URI, so
+equivalent request spellings reuse the same cache entry. The disk backend is pruned after writes to
+stay under `--cache-max-mb` (default `4096`). Set `--cache-max-mb 0` to disable the disk response
+cache. For Dragonfly, size eviction is managed by Dragonfly itself, typically through `maxmemory` and
+cache mode. `--cache-ttl-sec` adds optional time-based expiry for both backends; `0` disables TTL
+expiry. Cache entries include a source namespace prefix, so individual images can be purged without
+deleting the whole response cache. Image responses are also browser-cacheable for 24 hours, so after
+changing decoder behavior or purging the server-side cache, use a hard browser reload if old
+OpenSeadragon tiles remain visible.
+
+### Operational Limits and Security
+
+The server has built-in guard rails intended for production-style Kramerius deployments:
+
+- `--max-output-pixels` caps encoded response area and also bounds `max`/`full` downsizing.
+- `--max-upscale` caps explicit IIIF `^` upscaling. Non-`^` upscale requests are rejected.
+- `--max-concurrent-renders` limits global blocking render jobs.
+- `--max-concurrent-renders-per-ip` limits concurrent renders from one client key.
+- `--max-concurrent-renders-per-file` limits concurrent renders for one source image.
+- `--render-timeout-sec` caps the HTTP response wait for decode/render/encode work.
+- `--rate-limit-per-minute` applies a fixed-window per-client request rate limit; `0` disables it.
+- `--enforce-read-only-root` rejects startup when the persistent cache directory is inside the image
+  root.
+
+Client identity uses `X-Forwarded-For` first, then `X-Real-IP`, then a shared local key. In a real
+deployment, put the server behind a trusted reverse proxy and only pass those headers from the proxy.
+The image root resolver rejects traversal, overlong identifiers, control characters, unsupported
+extensions, and canonical paths that escape the configured root, including symlink escapes. IIIF
+region, size, rotation, quality, and format tokens also have length and control-character checks so
+malformed URLs fail before expensive metadata or render work starts.
+
+`--enforce-read-only-root` prevents GigaTIFF from using a cache under the served image tree, but the
+strongest protection is still to mount `/data` read-only in Docker/Podman and write cache files to a
+separate volume. If the Grok CLI fallback is used in production, sandbox it at the container/runtime
+level with a read-only root filesystem, no-new-privileges, seccomp/AppArmor, memory/CPU limits, and a
+restricted writable temp/cache volume. The Grok FFI/OpenJPEG FFI server path avoids spawning external
+decoder commands for normal image responses.
 
 Useful endpoints:
 
 ```text
+GET /healthz
+GET /readyz
 GET /api/images
 GET /api/cache
 DELETE /api/cache
+DELETE /api/cache/<image-id>
+POST /api/cache/warm/<image-id>
+GET /api/info/<image-id>
+GET /metrics
 GET /viewer/<image-id>
 GET /iiif/3/<image-id>
 GET /iiif/3/<image-id>/info.json
 GET /iiif/3/<image-id>/<region>/<size>/<rotation>/<quality>.<format>
 ```
 
+`GET /healthz` is a cheap liveness probe for container runtimes. `GET /readyz` checks the image
+root and the configured response-cache backend; with `--cache-backend dragonfly` it also sends a
+Dragonfly/Redis `PING`. Probe and metrics routes bypass the built-in HTTP rate limiter so Kubernetes,
+systemd, Caddy, or Prometheus checks do not consume client request quota.
+
 The root page `/` is a small local dashboard with image links, cache size, last prune/purge summary,
 and a manual cache purge action.
+
+`GET /api/info/<image-id>` is a GigaTIFF metadata extension, separate from IIIF `info.json`. It
+returns technical source metadata such as dimensions, TIFF compression/layout tags, resolution/DPI,
+ICC presence, JPEG2000 component precision, tile size, progression order, resolution levels, backend
+region-tile support, and a lightweight metadata-based profile validation summary. It is intended for
+diagnostics and library-system integration; full archival validation should still use dedicated tools
+such as valid2000, JHOVE, or jpylyzer.
+
+`DELETE /api/cache/<image-id>` purges cached responses for one source image. `POST
+/api/cache/warm/<image-id>` pre-renders a small default warm set: a full-image WebP thumbnail and the
+first advertised WebP tile/region. This is intentionally conservative; future production deployments
+can extend the same API toward queue-based prewarming and Dragonfly/Redis-backed shared cache storage.
+
+`GET /metrics` exposes Prometheus text-format metrics. The server records HTTP request/response
+counters, rate-limited request counts, cache hits/misses/disabled responses and hit ratio, cache size
+pressure, render job counts, render timeout counts, render queue wait time, active render tasks,
+render/decode/encode/cache timing totals, JPEG2000 decode timing per backend, and Grok-to-OpenJPEG
+fallback counts. On Linux it also emits process RSS and virtual-memory gauges from
+`/proc/self/status`.
+
+Every HTTP response includes `x-request-id`. If the client sends that header, the value is preserved;
+otherwise the server generates a local id. Access logs are written as one JSON object per request on
+stderr with request id, method, path, coarse route, status, and duration in milliseconds.
 
 IIIF image responses include lightweight diagnostic headers:
 
 ```text
+x-request-id
 x-gigatiff-cache: hit|miss|disabled
 x-gigatiff-total-ms
 x-gigatiff-cache-read-ms
@@ -266,7 +333,8 @@ docker build -t gigatiff-server .
 docker run --rm -p 8080:8080 -v "$PWD/images:/data:ro" -v "$PWD/cache:/cache" gigatiff-server
 ```
 
-The included `docker-compose.yml` runs `gigatiff-server` behind Caddy on `127.0.0.1:18082`:
+The included `docker-compose.yml` runs `gigatiff-server` behind Caddy on `127.0.0.1:18082` and uses
+Dragonfly as the shared encoded response cache:
 
 ```bash
 mkdir -p images
@@ -274,6 +342,61 @@ docker compose up --build
 ```
 
 Then open `http://127.0.0.1:18082/api/images` or a returned `viewer_url`.
+
+To run a native server against an existing Dragonfly instance:
+
+```bash
+gigatiff-server \
+  --root /path/to/images \
+  --cache-backend dragonfly \
+  --dragonfly-url redis://127.0.0.1:6379/ \
+  --cache-namespace gigatiff-server-response-v10
+```
+
+Every server CLI option can also be configured through an environment variable. See
+`ops/gigatiff-server.env.example` for the full list. Command-line arguments still take precedence
+when both are provided.
+
+### Production Packaging
+
+The repository includes first-pass production deployment templates under `ops/`:
+
+- `ops/gigatiff-server.env.example` contains `GIGATIFF_*` environment variables for native, Compose,
+  and Kubernetes deployments.
+- `ops/compose.production.yml` runs GigaTIFF Server behind Caddy with Dragonfly as the shared encoded
+  response cache, read-only image mounts, a read-only container filesystem, dropped Linux
+  capabilities, and health checks.
+- `ops/systemd/gigatiff-server.service` is a hardened native Linux service example using
+  `EnvironmentFile=/etc/gigatiff/gigatiff-server.env`.
+- `ops/kubernetes/gigatiff-server.yaml` is a minimal Deployment/Service example with liveness and
+  readiness probes, read-only root filesystem, resource requests/limits, and a ConfigMap-based
+  environment.
+- `scripts/build-server-image.ps1` builds the server image with Docker BuildKit SBOM and provenance
+  attestations enabled.
+
+The Dockerfile uses Debian Trixie for both build and runtime stages (`rust:1.96.0-trixie` and
+`debian:trixie-slim`) and exposes `/healthz` as the image healthcheck. The Compose templates pin
+Caddy and Dragonfly to explicit tags instead of `latest`; for stricter production reproducibility,
+replace tags with image digests in your deployment environment.
+
+Example image build with SBOM/provenance:
+
+```powershell
+.\scripts\build-server-image.ps1 -Image ghcr.io/bezverec/gigatiff-server:0.2.0
+```
+
+Multi-arch publication can use the same helper when the builder supports the requested platforms:
+
+```powershell
+.\scripts\build-server-image.ps1 `
+  -Image ghcr.io/bezverec/gigatiff-server:0.2.0 `
+  -Platform linux/amd64,linux/arm64 `
+  -Push
+```
+
+The current runtime configuration surface is CLI plus environment variables. TOML/YAML config files
+are still a planned convenience layer, useful once the server has more deployment profiles and
+per-backend tuning knobs.
 
 ### IIIF Smoke Test
 
@@ -435,6 +558,7 @@ openjpeg-sys = 1.0.12
 percent-encoding = 2.3.2
 png     = 0.18.1
 rayon   = 1.12.0
+redis   = 1.2.2
 rfd     = 0.17.2
 serde   = 1.0.228
 serde_json = 1.0.150
@@ -461,8 +585,9 @@ The reader loads an embedded ICC profile from the TIFF `IccProfile` tag when pre
 The `info` command prints the ICC profile size, and the GUI shows either `ICC ... bytes` or `no ICC`.
 
 The default `libtiff` scanline backend and the raw-strip fallback convert RGB/RGBA/Gray data in both
-8-bit and 16-bit formats to sRGB through `lcms2`. If a TIFF has no ICC profile, the viewer keeps the
-faster path without a color transform.
+8-bit and 16-bit formats to sRGB through `lcms2`. The server also applies embedded JPEG2000 ICC
+profiles on the OpenJPEG FFI backend before encoding browser responses. If a source has no ICC
+profile, the renderer keeps the faster path without a color transform.
 
 ## Performance Notes
 
@@ -531,6 +656,10 @@ sources, the hybrid server falls back to the direct OpenJPEG FFI backend, then a
 geometry, quality conversion, encoding, and persistent response cache used by TIFF responses. First
 requests for those master tiles are slower than TIFF and Grok user-copy JP2 tiles, but warm requests
 are served from the encoded response cache.
+
+The OpenJPEG FFI path reads embedded JP2 ICC profiles and converts decoded Gray/RGB 8-bit and 16-bit
+samples to sRGB through `lcms2`. The persistent response cache namespace is bumped when this color
+pipeline changes so old cached tiles do not mask corrected output.
 
 ## Benchmarks
 
@@ -894,11 +1023,16 @@ cargo build --release -p gigatiff-desktop --bin gigatiff
 - targets IIIF Image API 3.0 `level2` with region, size, rotation, mirroring, color/gray/bitonal
   quality, preferred-sizes, profile-link, canonical-link, and base-URI redirect coverage,
 - emits PNG, JPEG, and WebP IIIF image responses,
-- supports persistent encoded response caching with size pruning and canonical IIIF cache keys,
-- exposes cache stats and manual cache purge endpoints,
+- supports persistent encoded response caching with canonical IIIF cache keys, using either local
+  disk storage or Dragonfly/Redis-compatible shared storage,
+- exposes metadata, cache stats, cache warmup, cache purge, health/readiness, and Prometheus metrics
+  endpoints,
+- applies per-server, per-client, and per-file render concurrency limits,
+- applies request rate limiting, render response timeouts, maximum output pixels, maximum upscale,
+  stricter IIIF URL validation, and read-only-root deployment checks,
 - includes a tiny generated TIFF fixture and IIIF smoke test for CI,
-- limits concurrent TIFF render jobs to avoid flooding libtiff during fast pan/zoom interaction,
-- includes Docker and Caddy configuration for local browser testing.
+- includes Docker and Caddy configuration for local browser testing plus first-pass Compose,
+  systemd, Kubernetes, and SBOM-oriented production packaging examples.
 
 ## Sample Files
 
@@ -933,6 +1067,12 @@ Useful next steps for the image server:
 - benchmark full-image JP2 thumbnails separately from tile/region requests and tune reduction
   selection for both Grok FFI and OpenJPEG fallback paths,
 - run tile-size and output-size sweeps for WebP/JPEG/PNG and record the best default request shapes,
+- harden and benchmark Dragonfly-backed shared response cache storage for multi-instance deployments,
+  including production maxmemory settings and cache prewarming queues,
+- add TOML/YAML config-file loading on top of the current CLI/environment configuration surface,
+- pin production container images by digest once release image publishing is stable,
+- add a real multi-arch Linux server image pipeline for `linux/amd64` and `linux/arm64` if ARM
+  deployment becomes useful,
 - add automated OpenSeadragon browser smoke tests on top of the current HTTP-level IIIF smoke test,
 - evaluate lossy WebP encoding options once the Rust ecosystem path is stable enough for release builds.
 
@@ -941,5 +1081,6 @@ Useful next release and deployment steps:
 - publish a Linux server Docker image after the Grok FFI CI path is stable,
 - document the server support policy explicitly: native Linux first, Docker/Podman for other systems,
 - add Caddy auth/TLS examples for team sharing,
+- wire SBOM/provenance attestation upload into the release image workflow,
 - decide whether the next public version is a combined `0.3.0` release or separate Desktop/Server
   version labels.

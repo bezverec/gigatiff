@@ -24,6 +24,9 @@ pub struct ImageInfo {
     pub samples_per_pixel: Option<u32>,
     pub planar_config: Option<u32>,
     pub photometric: Option<u32>,
+    pub x_resolution: Option<f64>,
+    pub y_resolution: Option<f64>,
+    pub resolution_unit: Option<u32>,
     pub is_bigtiff: bool,
     pub little_endian: bool,
     pub rows_per_strip: Option<u32>,
@@ -51,6 +54,9 @@ pub fn print_info(path: &Path) -> Result<()> {
     println!("samples per pixel: {}", opt_u32(info.samples_per_pixel));
     println!("photometric tag: {}", opt_u32(info.photometric));
     println!("planar config: {}", opt_u32(info.planar_config));
+    println!("x resolution: {}", opt_f64(info.x_resolution));
+    println!("y resolution: {}", opt_f64(info.y_resolution));
+    println!("resolution unit tag: {}", opt_u32(info.resolution_unit));
     println!(
         "icc profile: {}",
         info.icc_profile
@@ -106,6 +112,9 @@ fn read_info(path: &Path, decoder: &mut Decoder<BufReader<File>>) -> Result<Imag
         samples_per_pixel: tag_u32(decoder, Tag::SamplesPerPixel),
         planar_config: tag_u32(decoder, Tag::PlanarConfiguration),
         photometric: tag_u32(decoder, Tag::PhotometricInterpretation),
+        x_resolution: decoder.get_tag_f64(Tag::XResolution).ok(),
+        y_resolution: decoder.get_tag_f64(Tag::YResolution).ok(),
+        resolution_unit: tag_u32(decoder, Tag::ResolutionUnit),
         is_bigtiff: sniff_header(path).map(|h| h.is_bigtiff).unwrap_or(false),
         little_endian: sniff_header(path).map(|h| h.little_endian).unwrap_or(true),
         rows_per_strip: tag_u32(decoder, Tag::RowsPerStrip),
@@ -166,6 +175,12 @@ fn sniff_header(path: &Path) -> Result<TiffHeader> {
 fn opt_u32(value: Option<u32>) -> String {
     value
         .map(|v| v.to_string())
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn opt_f64(value: Option<f64>) -> String {
+    value
+        .map(|v| format!("{v:.3}"))
         .unwrap_or_else(|| "n/a".to_string())
 }
 

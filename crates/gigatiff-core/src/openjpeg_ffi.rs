@@ -3,9 +3,12 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
+use lcms2::{DisallowCache, Flags, GlobalContext, Intent, PixelFormat, Profile, Transform};
 use openjpeg_sys as opj;
 
 use crate::render::Rect;
+
+type LcmsTransform = Transform<u8, u8, GlobalContext, DisallowCache>;
 
 pub struct OpenJpegBitmap {
     pub width: u32,
@@ -227,7 +230,13 @@ unsafe fn image_to_rgba(image: *mut opj::opj_image_t) -> Result<(u32, u32, Vec<u
         bail!("OpenJPEG returned empty image components");
     }
 
+    let color_transform = unsafe { OpenJpegColorTransform::new(image_ref, comps)? };
     let mut rgba = vec![255u8; width as usize * height as usize * 4];
+    if let Some(transform) = color_transform {
+        transform.write_rgba(comps, width, height, &mut rgba)?;
+        return Ok((width, height, rgba));
+    }
+
     for y in 0..height as usize {
         for x in 0..width as usize {
             let dst = (y * width as usize + x) * 4;
@@ -247,6 +256,148 @@ unsafe fn image_to_rgba(image: *mut opj::opj_image_t) -> Result<(u32, u32, Vec<u
     Ok((width, height, rgba))
 }
 
+enum OpenJpegColorTransform {
+    Gray8(LcmsTransform),
+    Gray16(LcmsTransform),
+    Rgb8(LcmsTransform),
+    Rgb16(LcmsTransform),
+}
+
+impl OpenJpegColorTransform {
+    unsafe fn new(
+        image: &opj::opj_image_t,
+        components: &[opj::opj_image_comp_t],
+    ) -> Result<Option<Self>> {
+        if image.icc_profile_buf.is_null() || image.icc_profile_len == 0 {
+            return Ok(None);
+        }
+
+        let Some(first) = components.first() else {
+            return Ok(None);
+        };
+        let color_components = if components.len() >= 3 { 3 } else { 1 };
+        let precision = first.prec;
+        if precision == 0 || precision > 16 {
+            return Ok(None);
+        }
+
+        let input_format = match (color_components, precision <= 8) {
+            (1, true) => PixelFormat::GRAY_8,
+            (1, false) => PixelFormat::GRAY_16,
+            (3, true) => PixelFormat::RGB_8,
+            (3, false) => PixelFormat::RGB_16,
+            _ => return Ok(None),
+        };
+
+        let icc_profile = unsafe {
+            std::slice::from_raw_parts(image.icc_profile_buf, image.icc_profile_len as usize)
+        };
+        let input = Profile::new_icc(icc_profile).context("reading JPEG2000 ICC profile")?;
+        let output = Profile::new_srgb();
+        let transform = LcmsTransform::new_flags_context(
+            GlobalContext::new(),
+            &input,
+            input_format,
+            &output,
+            PixelFormat::RGB_8,
+            Intent::Perceptual,
+            Flags::NO_CACHE | Flags::BLACKPOINT_COMPENSATION,
+        )
+        .context("creating lcms2 JPEG2000 sRGB transform")?;
+
+        Ok(Some(match (color_components, precision <= 8) {
+            (1, true) => Self::Gray8(transform),
+            (1, false) => Self::Gray16(transform),
+            (3, true) => Self::Rgb8(transform),
+            (3, false) => Self::Rgb16(transform),
+            _ => unreachable!("input format was checked above"),
+        }))
+    }
+
+    fn write_rgba(
+        &self,
+        components: &[opj::opj_image_comp_t],
+        width: u32,
+        height: u32,
+        rgba: &mut [u8],
+    ) -> Result<()> {
+        let color_components = self.color_components();
+        for component in &components[..color_components] {
+            if component.data.is_null() || component.w == 0 || component.h == 0 {
+                bail!("OpenJPEG returned a component without sample data");
+            }
+        }
+
+        let row_samples = width as usize * color_components * self.bytes_per_sample();
+        let mut input = vec![0u8; row_samples];
+        let mut rgb = vec![0u8; width as usize * 3];
+        for y in 0..height as usize {
+            self.write_input_row(components, width, height, y, &mut input)?;
+            self.transform_pixels(&input, &mut rgb);
+            let row_offset = y * width as usize * 4;
+            for (x, rgb_px) in rgb.chunks_exact(3).enumerate() {
+                let dst = row_offset + x * 4;
+                rgba[dst..dst + 3].copy_from_slice(rgb_px);
+                rgba[dst + 3] = 255;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn write_input_row(
+        &self,
+        components: &[opj::opj_image_comp_t],
+        out_width: u32,
+        out_height: u32,
+        y: usize,
+        input: &mut [u8],
+    ) -> Result<()> {
+        let color_components = self.color_components();
+        let bytes_per_sample = self.bytes_per_sample();
+        for x in 0..out_width as usize {
+            for component_index in 0..color_components {
+                let component = &components[component_index];
+                let sample = component_sample(component, x, y, out_width, out_height)
+                    .with_context(|| {
+                        format!("reading OpenJPEG component {component_index} sample")
+                    })?;
+                let dst = (x * color_components + component_index) * bytes_per_sample;
+                if bytes_per_sample == 1 {
+                    input[dst] = sample_to_u8(sample, component.prec, component.sgnd != 0);
+                } else {
+                    let value = sample_to_u16(sample, component.prec, component.sgnd != 0);
+                    input[dst..dst + 2].copy_from_slice(&value.to_ne_bytes());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn transform_pixels(&self, input: &[u8], rgb: &mut [u8]) {
+        match self {
+            Self::Gray8(transform)
+            | Self::Gray16(transform)
+            | Self::Rgb8(transform)
+            | Self::Rgb16(transform) => transform.transform_pixels(input, rgb),
+        }
+    }
+
+    fn color_components(&self) -> usize {
+        match self {
+            Self::Gray8(_) | Self::Gray16(_) => 1,
+            Self::Rgb8(_) | Self::Rgb16(_) => 3,
+        }
+    }
+
+    fn bytes_per_sample(&self) -> usize {
+        match self {
+            Self::Gray8(_) | Self::Rgb8(_) => 1,
+            Self::Gray16(_) | Self::Rgb16(_) => 2,
+        }
+    }
+}
+
 fn component_sample_to_u8(
     component: &opj::opj_image_comp_t,
     x: usize,
@@ -261,12 +412,29 @@ fn component_sample_to_u8(
         .min(component.w.saturating_sub(1) as u64) as usize;
     let cy = (y as u64 * component.h as u64 / out_height as u64)
         .min(component.h.saturating_sub(1) as u64) as usize;
+    let sample = component_sample(component, cx, cy, component.w, component.h)?;
+    Ok(sample_to_u8(sample, component.prec, component.sgnd != 0))
+}
+
+fn component_sample(
+    component: &opj::opj_image_comp_t,
+    x: usize,
+    y: usize,
+    out_width: u32,
+    out_height: u32,
+) -> Result<i32> {
+    if component.data.is_null() || component.w == 0 || component.h == 0 {
+        bail!("OpenJPEG returned a component without sample data");
+    }
+    let cx = (x as u64 * component.w as u64 / out_width as u64)
+        .min(component.w.saturating_sub(1) as u64) as usize;
+    let cy = (y as u64 * component.h as u64 / out_height as u64)
+        .min(component.h.saturating_sub(1) as u64) as usize;
     let index = cy
         .checked_mul(component.w as usize)
         .and_then(|base| base.checked_add(cx))
         .ok_or_else(|| anyhow!("OpenJPEG component index overflow"))?;
-    let sample = unsafe { *component.data.add(index) };
-    Ok(sample_to_u8(sample, component.prec, component.sgnd != 0))
+    Ok(unsafe { *component.data.add(index) })
 }
 
 fn sample_to_u8(sample: i32, precision: u32, signed: bool) -> u8 {
@@ -279,6 +447,18 @@ fn sample_to_u8(sample: i32, precision: u32, signed: bool) -> u8 {
     let max_value = ((1u64 << precision) - 1).max(1);
     let clamped = value.clamp(0, max_value as i32) as u64;
     ((clamped * 255 + max_value / 2) / max_value) as u8
+}
+
+fn sample_to_u16(sample: i32, precision: u32, signed: bool) -> u16 {
+    let precision = precision.clamp(1, 31);
+    let value = if signed {
+        sample.saturating_add(1i32.checked_shl(precision.saturating_sub(1)).unwrap_or(0))
+    } else {
+        sample
+    };
+    let max_value = ((1u64 << precision) - 1).max(1);
+    let clamped = value.clamp(0, max_value as i32) as u64;
+    ((clamped * 65535 + max_value / 2) / max_value) as u16
 }
 
 fn reduce_factor(rect: Rect, out_width: u32, out_height: u32) -> u32 {

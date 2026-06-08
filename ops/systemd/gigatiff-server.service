@@ -1,0 +1,30 @@
+[Unit]
+Description=GigaTIFF IIIF image server
+Documentation=https://github.com/bezverec/gigatiff
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/gigatiff/gigatiff-server.env
+ExecStart=/usr/local/bin/gigatiff-server
+Restart=on-failure
+RestartSec=5s
+DynamicUser=yes
+StateDirectory=gigatiff
+CacheDirectory=gigatiff
+ReadOnlyPaths=/data
+ReadWritePaths=/var/cache/gigatiff /var/lib/gigatiff
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

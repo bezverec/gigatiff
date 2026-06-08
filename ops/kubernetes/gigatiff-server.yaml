@@ -1,0 +1,99 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gigatiff-server-config
+data:
+  GIGATIFF_ROOT: /data
+  GIGATIFF_ADDR: 0.0.0.0:8080
+  GIGATIFF_CACHE_BACKEND: dragonfly
+  GIGATIFF_DRAGONFLY_URL: redis://dragonfly:6379/
+  GIGATIFF_CACHE_NAMESPACE: gigatiff-server-response-v10
+  GIGATIFF_CACHE_TTL_SEC: "604800"
+  GIGATIFF_MAX_CONCURRENT_RENDERS: "4"
+  GIGATIFF_MAX_CONCURRENT_RENDERS_PER_IP: "2"
+  GIGATIFF_MAX_CONCURRENT_RENDERS_PER_FILE: "2"
+  GIGATIFF_RENDER_TIMEOUT_SEC: "120"
+  GIGATIFF_RATE_LIMIT_PER_MINUTE: "600"
+  GIGATIFF_ENFORCE_READ_ONLY_ROOT: "true"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gigatiff-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gigatiff-server
+  template:
+    metadata:
+      labels:
+        app: gigatiff-server
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: gigatiff-server
+          image: ghcr.io/bezverec/gigatiff-server:0.2.0
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: gigatiff-server-config
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 30
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: "1"
+              memory: 1Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: images
+              mountPath: /data
+              readOnly: true
+            - name: cache
+              mountPath: /cache
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: images
+          persistentVolumeClaim:
+            claimName: gigatiff-images
+        - name: cache
+          emptyDir: {}
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gigatiff-server
+spec:
+  selector:
+    app: gigatiff-server
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

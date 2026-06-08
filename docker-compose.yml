@@ -1,4 +1,15 @@
 services:
+  dragonfly:
+    image: docker.dragonflydb.io/dragonflydb/dragonfly:v1.30.3
+    command:
+      - --cache_mode=true
+      - --maxmemory=2gb
+      - --proactor_threads=4
+    ulimits:
+      memlock: -1
+    volumes:
+      - dragonfly_data:/data
+
   gigatiff-server:
     build:
       context: .
@@ -10,6 +21,12 @@ services:
       - /data
       - --cache-dir
       - /cache
+      - --cache-backend
+      - dragonfly
+      - --dragonfly-url
+      - redis://dragonfly:6379/
+      - --cache-namespace
+      - gigatiff-server-response-v10
       - --cache-max-mb
       - "4096"
       - --max-concurrent-renders
@@ -19,9 +36,11 @@ services:
     volumes:
       - ./images:/data:ro
       - ./cache:/cache
+    depends_on:
+      - dragonfly
 
   caddy:
-    image: caddy:2
+    image: caddy:2.11.4
     depends_on:
       - gigatiff-server
     ports:
@@ -32,5 +51,6 @@ services:
       - caddy_config:/config
 
 volumes:
+  dragonfly_data:
   caddy_data:
   caddy_config:

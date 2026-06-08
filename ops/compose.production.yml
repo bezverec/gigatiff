@@ -1,0 +1,61 @@
+services:
+  dragonfly:
+    image: ${DRAGONFLY_IMAGE:-docker.dragonflydb.io/dragonflydb/dragonfly:v1.30.3}
+    command:
+      - --cache_mode=true
+      - --maxmemory=${DRAGONFLY_MAX_MEMORY:-8gb}
+      - --proactor_threads=${DRAGONFLY_THREADS:-4}
+    restart: unless-stopped
+    ulimits:
+      memlock: -1
+    volumes:
+      - dragonfly_data:/data
+    healthcheck:
+      test: ["CMD", "dragonfly", "--version"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  gigatiff-server:
+    image: ${GIGATIFF_IMAGE:-ghcr.io/bezverec/gigatiff-server:0.2.0}
+    restart: unless-stopped
+    env_file:
+      - ./gigatiff-server.env.example
+    environment:
+      GIGATIFF_DRAGONFLY_URL: redis://dragonfly:6379/
+    read_only: true
+    tmpfs:
+      - /tmp:size=1g,noexec,nosuid,nodev
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    volumes:
+      - ${GIGATIFF_IMAGE_ROOT:-../images}:/data:ro
+      - gigatiff_cache:/cache
+    depends_on:
+      - dragonfly
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+  caddy:
+    image: ${CADDY_IMAGE:-caddy:2.11.4}
+    restart: unless-stopped
+    depends_on:
+      - gigatiff-server
+    ports:
+      - "${GIGATIFF_PUBLIC_BIND:-127.0.0.1:18082}:80"
+    volumes:
+      - ../Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  dragonfly_data:
+  gigatiff_cache:
+  caddy_data:
+  caddy_config:
