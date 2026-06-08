@@ -31,6 +31,8 @@ services:
       - "4096"
       - --max-concurrent-renders
       - "4"
+      - --openjpeg-threads
+      - "4"
       - --addr
       - 0.0.0.0:8080
     volumes:

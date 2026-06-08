@@ -205,6 +205,9 @@ The server has built-in guard rails intended for production-style Kramerius depl
 - `--max-concurrent-renders` limits global blocking render jobs.
 - `--max-concurrent-renders-per-ip` limits concurrent renders from one client key.
 - `--max-concurrent-renders-per-file` limits concurrent renders for one source image.
+- `--openjpeg-threads` sets the number of worker threads inside each OpenJPEG FFI decode. The CLI
+  default is `1`; Docker/ops examples use `4` because it improved the tested large-tile JP2 first
+  viewport while leaving the setting easy to tune per host.
 - `--render-timeout-sec` caps the HTTP response wait for decode/render/encode work.
 - `--rate-limit-per-minute` applies a fixed-window per-client request rate limit; `0` disables it.
 - `--enforce-read-only-root` rejects startup when the persistent cache directory is inside the image
@@ -322,6 +325,11 @@ the cases where Grok 20.3.3 returned sparse gray-grid region output in local tes
 files use Grok FFI because it is faster for the 1024 x 1024 tiled user-copy samples. If an auto
 Grok render fails and OpenJPEG FFI is available, the server retries through OpenJPEG FFI. The actual
 backend used for an IIIF image response is reported in `x-gigatiff-jp2-backend`.
+
+`--openjpeg-threads` controls the thread count used inside each OpenJPEG FFI region decode. Keep this
+balanced with `--max-concurrent-renders-per-ip` and `--max-concurrent-renders-per-file`: for example,
+the Docker examples use two concurrent per-file renders and four OpenJPEG threads, so a single first
+viewport can use up to roughly eight OpenJPEG worker threads on large-tile master JP2 files.
 
 ### Docker and Caddy
 
@@ -936,6 +944,24 @@ uses the default `512` tile size and detects a large-tile JP2 master that is rou
 fallback, `info.json` advertises `1024 x 1024` tiles. This does not make a single JP2 decode faster;
 it reduces the number of expensive first-viewport decodes.
 
+OpenJPEG FFI thread-count benchmark on the same large-tile JP2 master samples, using the auto
+`1024 x 1024` advertised-tile policy above. These runs were sequential Docker runs with a purged
+server response cache and warmed operating-system file cache:
+
+```text
+openjpeg threads  image                              startup viewport wall  server render
+1                 mapa2_no_xmp_clean_master.jp2                  1795.7 ms      1374.9 ms
+2                 mapa2_no_xmp_clean_master.jp2                  1414.2 ms      1305.6 ms
+4                 mapa2_no_xmp_clean_master.jp2                  1153.4 ms      1066.2 ms
+1                 mapa2_master.jp2                               2063.0 ms      1952.1 ms
+2                 mapa2_master.jp2                               1907.6 ms      1798.8 ms
+4                 mapa2_master.jp2                               1801.4 ms      1710.9 ms
+```
+
+The single-tile timings were not uniformly best at four threads, but the real first-viewport scenario
+was best at `--openjpeg-threads 4` on this machine. The CLI default remains conservative at `1`, while
+Docker/ops examples set `GIGATIFF_OPENJPEG_THREADS=4` as the current large-JP2 starting point.
+
 Small WebP tile-size smoke run after the `pct:` IIIF update
 (`-ImageIds mapa2_no_xmp_clean.tif -Formats webp -OutputSizes 128,256 -Iterations 2 -Parallel 2 -ClearCache`):
 
@@ -1097,8 +1123,8 @@ Useful next steps for the image server:
   overview requests, output sizes, and repeated warm-cache OpenSeadragon navigation,
 - investigate whether Grok has a newer region-decode path or parameter set that fixes sparse
   gray-grid output for 4096 x 4096 RPCL master codestreams,
-- tune the direct OpenJPEG FFI path, especially reduction choice, component conversion, and
-  concurrent region decode behavior,
+- tune the direct OpenJPEG FFI path further, especially adaptive thread count, reduction choice, and
+  component conversion cost,
 - investigate why lower-rate JP2 user-copy region requests are slower through FFI than through the
   CLI backend, especially around Grok reduction/update behavior and component copy cost,
 - benchmark full-image JP2 thumbnails separately from tile/region requests and tune reduction

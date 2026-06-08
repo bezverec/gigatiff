@@ -46,10 +46,11 @@ pub fn render_region(
     rect: Rect,
     out_width: u32,
     out_height: u32,
+    threads: i32,
 ) -> Result<OpenJpegBitmap> {
     let reduce = reduce_factor(rect, out_width, out_height);
     let decode_start = Instant::now();
-    let decoder = Decoder::open(path, 1, reduce)?;
+    let decoder = Decoder::open(path, threads.max(1), reduce)?;
     set_decode_area(decoder.codec, decoder.image, rect)?;
 
     let decoded = unsafe { opj::opj_decode(decoder.codec, decoder.stream, decoder.image) } != 0;

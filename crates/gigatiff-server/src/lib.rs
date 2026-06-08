@@ -98,6 +98,10 @@ struct ServerCli {
     #[arg(long, env = "GIGATIFF_JP2_BACKEND", value_enum, default_value_t = Jp2BackendPolicy::Auto)]
     jp2_backend: Jp2BackendPolicy,
 
+    /// Worker threads used inside each OpenJPEG FFI decode. Use 1 for single-threaded decoding.
+    #[arg(long, env = "GIGATIFF_OPENJPEG_THREADS", default_value_t = 1)]
+    openjpeg_threads: usize,
+
     /// Directory for persistent encoded IIIF region/tile responses.
     #[arg(long, env = "GIGATIFF_CACHE_DIR", default_value = "cache/server")]
     cache_dir: PathBuf,
@@ -185,6 +189,8 @@ struct AppState {
     quality: u8,
     backend: Backend,
     jp2_backend: Jp2BackendPolicy,
+    #[cfg_attr(not(feature = "jpeg2000-openjpeg-ffi"), allow(dead_code))]
+    openjpeg_threads: usize,
     cache_dir: Arc<PathBuf>,
     cache_backend: ResponseCacheBackend,
     dragonfly_cache: Option<Arc<DragonflyCache>>,
@@ -528,6 +534,7 @@ pub async fn run_from_cli() -> Result<()> {
         quality: cli.quality,
         backend: cli.backend,
         jp2_backend: cli.jp2_backend,
+        openjpeg_threads: cli.openjpeg_threads.max(1),
         cache_dir: Arc::new(cache_dir),
         cache_backend: cli.cache_backend,
         dragonfly_cache,
@@ -2633,6 +2640,7 @@ fn render_iiif_image(
             out_height,
             jp2_backend.ok_or_else(|| anyhow!("missing JPEG2000 backend selection"))?,
             state.jp2_backend == Jp2BackendPolicy::Auto,
+            state.openjpeg_threads,
         )?,
     };
     timing.render = render_start.elapsed();
@@ -4191,6 +4199,7 @@ fn render_jpeg2000_preview(
     out_height: u32,
     backend: Jp2RenderBackend,
     allow_grok_fallback: bool,
+    openjpeg_threads: usize,
 ) -> Result<(PreviewBitmap, Option<Jp2RenderBackend>)> {
     let _ = info;
     let render = match backend {
@@ -4203,7 +4212,7 @@ fn render_jpeg2000_preview(
                 .with_context(|| "rendering JPEG2000 through Grok FFI")
         }
         Jp2RenderBackend::OpenJpegFfi => {
-            render_jpeg2000_openjpeg_preview(path, rect, out_width, out_height)
+            render_jpeg2000_openjpeg_preview(path, rect, out_width, out_height, openjpeg_threads)
                 .with_context(|| "rendering JPEG2000 through OpenJPEG FFI")
         }
     };
@@ -4214,8 +4223,14 @@ fn render_jpeg2000_preview(
             let Some(fallback) = openjpeg_backend() else {
                 return Err(err);
             };
-            let bitmap = render_jpeg2000_openjpeg_preview(path, rect, out_width, out_height)
-                .with_context(|| format!("{err}; fallback to OpenJPEG FFI also failed"))?;
+            let bitmap = render_jpeg2000_openjpeg_preview(
+                path,
+                rect,
+                out_width,
+                out_height,
+                openjpeg_threads,
+            )
+            .with_context(|| format!("{err}; fallback to OpenJPEG FFI also failed"))?;
             Ok((bitmap, Some(fallback)))
         }
         Err(err) => Err(err),
@@ -4373,9 +4388,16 @@ fn render_jpeg2000_openjpeg_preview(
     rect: Rect,
     out_width: u32,
     out_height: u32,
+    openjpeg_threads: usize,
 ) -> Result<PreviewBitmap> {
     let total_start = Instant::now();
-    let ffi = gigatiff_core::openjpeg_ffi::render_region(path, rect, out_width, out_height)?;
+    let ffi = gigatiff_core::openjpeg_ffi::render_region(
+        path,
+        rect,
+        out_width,
+        out_height,
+        openjpeg_threads.min(i32::MAX as usize) as i32,
+    )?;
     let convert_start = Instant::now();
     let rgba = if ffi.width == out_width && ffi.height == out_height {
         ffi.rgba
@@ -4409,6 +4431,7 @@ fn render_jpeg2000_openjpeg_preview(
     _rect: Rect,
     _out_width: u32,
     _out_height: u32,
+    _openjpeg_threads: usize,
 ) -> Result<PreviewBitmap> {
     bail!("OpenJPEG FFI JPEG2000 backend is not enabled")
 }
@@ -5734,6 +5757,7 @@ mod tests {
             quality: 85,
             backend: Backend::Auto,
             jp2_backend: Jp2BackendPolicy::Auto,
+            openjpeg_threads: 1,
             cache_dir: Arc::new(cache_dir),
             cache_backend: ResponseCacheBackend::Disk,
             dragonfly_cache: None,
