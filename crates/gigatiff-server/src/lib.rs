@@ -747,8 +747,8 @@ fn render_iiif_image(
             None,
         )?,
         #[cfg(feature = "jpeg2000-grok")]
-        ServerImageSource::Jpeg2000(_) => {
-            render_jpeg2000_grok_preview(&image_path, rect, out_width, out_height)?
+        ServerImageSource::Jpeg2000(jpeg2000_info) => {
+            render_jpeg2000_grok_preview(&image_path, jpeg2000_info, rect, out_width, out_height)?
         }
     };
     timing.render = render_start.elapsed();
@@ -816,7 +816,7 @@ fn response_cache_path(
         .unwrap_or_else(|_| image_path.to_path_buf());
 
     let mut hash = Fnv1a64::new();
-    hash.write_bytes(b"gigatiff-server-response-v5");
+    hash.write_bytes(b"gigatiff-server-response-v6");
     hash.write_bytes(canonical.to_string_lossy().as_bytes());
     hash.write_u64(metadata.len());
     hash.write_u64(modified.as_secs());
@@ -836,6 +836,7 @@ fn response_cache_path(
             hash.write_u64(jpeg2000_info.tile_width.unwrap_or_default() as u64);
             hash.write_u64(jpeg2000_info.tile_height.unwrap_or_default() as u64);
             hash.write_u64(u64::from(jpeg2000_supports_region_tiles(jpeg2000_info)));
+            hash.write_u64(u64::from(should_use_openjpeg_fallback(jpeg2000_info)));
         }
     }
     hash.write_u64(out_width as u64);
@@ -1679,26 +1680,40 @@ fn load_jpeg2000_info(path: &Path) -> Result<ServerImageInfo> {
 
 #[cfg(feature = "jpeg2000-grok")]
 fn jpeg2000_supports_region_tiles(info: &Jpeg2000Info) -> bool {
-    let has_small_tiles =
-        info.tile_width.unwrap_or_default() < 4096 && info.tile_height.unwrap_or_default() < 4096;
-    let has_high_precision = info.precision.unwrap_or_default() >= 16;
-    has_small_tiles || has_high_precision
+    #[cfg(feature = "jpeg2000-grok-ffi")]
+    {
+        return info.tile_width.is_some() && info.tile_height.is_some();
+    }
+
+    #[cfg(not(feature = "jpeg2000-grok-ffi"))]
+    {
+        let has_small_tiles = info.tile_width.unwrap_or_default() < 4096
+            && info.tile_height.unwrap_or_default() < 4096;
+        let has_high_precision = info.precision.unwrap_or_default() >= 16;
+        has_small_tiles || has_high_precision
+    }
 }
 
 #[cfg(feature = "jpeg2000-grok")]
 fn render_jpeg2000_grok_preview(
     path: &Path,
+    info: &Jpeg2000Info,
     rect: Rect,
     out_width: u32,
     out_height: u32,
 ) -> Result<PreviewBitmap> {
     #[cfg(feature = "jpeg2000-grok-ffi")]
     {
+        if should_use_large_tile_jpeg2000_fallback(info) {
+            return render_jpeg2000_openjpeg_preview(path, rect, out_width, out_height)
+                .with_context(|| "rendering large-tile JPEG2000 through OpenJPEG fallback");
+        }
         return render_jpeg2000_grok_ffi_preview(path, rect, out_width, out_height)
             .with_context(|| "rendering JPEG2000 through Grok FFI");
     }
     #[cfg(not(feature = "jpeg2000-grok-ffi"))]
     {
+        let _ = info;
         render_jpeg2000_grok_cli_preview(path, rect, out_width, out_height)
     }
 }
@@ -1812,6 +1827,100 @@ fn render_jpeg2000_grok_ffi_preview(
             read: Duration::ZERO,
             convert: ffi.convert + resize,
             decode: ffi.decode,
+            ..RenderStats::default()
+        },
+    })
+}
+
+#[cfg(feature = "jpeg2000-grok-ffi")]
+fn should_use_large_tile_jpeg2000_fallback(info: &Jpeg2000Info) -> bool {
+    should_use_openjpeg_fallback(info)
+}
+
+#[cfg(feature = "jpeg2000-grok")]
+fn should_use_openjpeg_fallback(info: &Jpeg2000Info) -> bool {
+    info.tile_width.unwrap_or_default() >= 4096 || info.tile_height.unwrap_or_default() >= 4096
+}
+
+#[cfg(feature = "jpeg2000-grok-ffi")]
+fn render_jpeg2000_openjpeg_preview(
+    path: &Path,
+    rect: Rect,
+    out_width: u32,
+    out_height: u32,
+) -> Result<PreviewBitmap> {
+    let total_start = Instant::now();
+    let temp_path = std::env::temp_dir().join(format!(
+        "gigatiff-openjpeg-{}-{}.ppm",
+        std::process::id(),
+        UNIX_EPOCH.elapsed().unwrap_or_default().as_nanos()
+    ));
+
+    let mut command = Command::new(openjpeg_decompress_command());
+    command
+        .arg("-i")
+        .arg(path)
+        .arg("-o")
+        .arg(&temp_path)
+        .arg("-d")
+        .arg(format!(
+            "{},{},{},{}",
+            rect.x,
+            rect.y,
+            rect.x.saturating_add(rect.width),
+            rect.y.saturating_add(rect.height)
+        ))
+        .arg("-threads")
+        .arg("1")
+        .arg("-force-rgb")
+        .arg("-quiet");
+
+    let reduce = grok_reduce_factor(rect, out_width, out_height);
+    if reduce > 0 {
+        command.arg("-r").arg(reduce.to_string());
+    }
+
+    let decode_start = Instant::now();
+    let output = command
+        .output()
+        .with_context(|| "running opj_decompress for JPEG2000 region")?;
+    let decode = decode_start.elapsed();
+
+    if !output.status.success() {
+        let _ = fs::remove_file(&temp_path);
+        bail!(
+            "opj_decompress failed for {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    let read_start = Instant::now();
+    let bytes = fs::read(&temp_path)
+        .with_context(|| format!("reading OpenJPEG output {}", temp_path.display()))?;
+    let _ = fs::remove_file(&temp_path);
+    let (decoded_width, decoded_height, rgba) = parse_pnm_rgba(&bytes)?;
+    let read = read_start.elapsed();
+
+    let convert_start = Instant::now();
+    let rgba = if decoded_width == out_width && decoded_height == out_height {
+        rgba
+    } else {
+        resize_nearest_rgba(&rgba, decoded_width, decoded_height, out_width, out_height)
+    };
+    let convert = convert_start.elapsed();
+
+    Ok(PreviewBitmap {
+        width: out_width,
+        height: out_height,
+        rgba,
+        source: "openjpeg-jpeg2000",
+        decoded_chunks: 1,
+        stats: RenderStats {
+            total: total_start.elapsed(),
+            read,
+            convert,
+            decode,
             ..RenderStats::default()
         },
     })
@@ -2018,6 +2127,12 @@ fn grok_dump_command() -> OsString {
 #[cfg(feature = "jpeg2000-grok")]
 fn grok_decompress_command() -> OsString {
     std::env::var_os("GIGATIFF_GROK_DECOMPRESS").unwrap_or_else(|| OsString::from("grk_decompress"))
+}
+
+#[cfg(feature = "jpeg2000-grok-ffi")]
+fn openjpeg_decompress_command() -> OsString {
+    std::env::var_os("GIGATIFF_OPENJPEG_DECOMPRESS")
+        .unwrap_or_else(|| OsString::from("opj_decompress"))
 }
 
 async fn load_cached_info(state: &AppState, path: &Path) -> Result<Arc<ServerImageInfo>> {
@@ -2776,17 +2891,20 @@ mod tests {
     #[cfg(feature = "jpeg2000-grok")]
     #[test]
     fn jpeg2000_metadata_controls_iiif_tile_advertisement() {
-        let info = ServerImageInfo {
-            width: 4096,
-            height: 2048,
-            source: ServerImageSource::Jpeg2000(Jpeg2000Info {
-                tile_width: Some(4096),
-                tile_height: Some(4096),
-                precision: Some(8),
-                ..Jpeg2000Info::default()
-            }),
-        };
-        assert!(!should_advertise_tiles(&info));
+        #[cfg(not(feature = "jpeg2000-grok-ffi"))]
+        {
+            let info = ServerImageInfo {
+                width: 4096,
+                height: 2048,
+                source: ServerImageSource::Jpeg2000(Jpeg2000Info {
+                    tile_width: Some(4096),
+                    tile_height: Some(4096),
+                    precision: Some(8),
+                    ..Jpeg2000Info::default()
+                }),
+            };
+            assert!(!should_advertise_tiles(&info));
+        }
 
         let info = ServerImageInfo {
             width: 4096,
@@ -2794,6 +2912,22 @@ mod tests {
             source: ServerImageSource::Jpeg2000(Jpeg2000Info {
                 tile_width: Some(1024),
                 tile_height: Some(1024),
+                precision: Some(8),
+                ..Jpeg2000Info::default()
+            }),
+        };
+        assert!(should_advertise_tiles(&info));
+    }
+
+    #[cfg(feature = "jpeg2000-grok-ffi")]
+    #[test]
+    fn jpeg2000_ffi_advertises_large_tiles_for_full_resolution_fallback() {
+        let info = ServerImageInfo {
+            width: 4096,
+            height: 2048,
+            source: ServerImageSource::Jpeg2000(Jpeg2000Info {
+                tile_width: Some(4096),
+                tile_height: Some(4096),
                 precision: Some(8),
                 ..Jpeg2000Info::default()
             }),
@@ -2816,12 +2950,16 @@ mod tests {
             precision: Some(16),
             ..Jpeg2000Info::default()
         }));
-        assert!(!jpeg2000_supports_region_tiles(&Jpeg2000Info {
+        let large_8bit = Jpeg2000Info {
             tile_width: Some(4096),
             tile_height: Some(4096),
             precision: Some(8),
             ..Jpeg2000Info::default()
-        }));
+        };
+        #[cfg(feature = "jpeg2000-grok-ffi")]
+        assert!(jpeg2000_supports_region_tiles(&large_8bit));
+        #[cfg(not(feature = "jpeg2000-grok-ffi"))]
+        assert!(!jpeg2000_supports_region_tiles(&large_8bit));
     }
 
     #[cfg(feature = "jpeg2000-grok")]

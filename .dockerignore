@@ -3,9 +3,11 @@ target
 dist
 *.tif
 *.tiff
+*.jp2
 *.png
 *.jpg
 *.jpeg
 *.webp
 images
 cache
+debug_tiles

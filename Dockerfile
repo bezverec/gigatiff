@@ -46,6 +46,7 @@ FROM debian:trixie-slim
 
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     ca-certificates \
+    libopenjp2-tools \
     liblcms2-2 \
     libstdc++6 \
     libtiff6 \
