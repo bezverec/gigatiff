@@ -8,12 +8,12 @@ use std::path::{Component, Path, PathBuf};
 #[cfg(feature = "jpeg2000-grok")]
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use axum::extract::Request;
-use axum::extract::{Path as AxumPath, State};
+use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, HOST, LINK, LOCATION};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{Next, from_fn_with_state};
@@ -25,7 +25,7 @@ use image::ExtendedColorType;
 use image::ImageEncoder;
 use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
 use redis::Commands;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -58,6 +58,10 @@ const MAX_IIIF_IDENTIFIER_SEGMENTS: usize = 64;
 const MAX_IIIF_IDENTIFIER_SEGMENT_LEN: usize = 255;
 const MAX_IIIF_TOKEN_LEN: usize = 128;
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+const VIEWER_PREWARM_DEDUPE_WINDOW: Duration = Duration::from_secs(30);
+const VIEWER_PREWARM_RECENT_LIMIT: usize = 512;
+const VIEWER_PREWARM_WIDTH: u32 = 2048;
+const VIEWER_PREWARM_HEIGHT: u32 = 1024;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -210,7 +214,51 @@ struct AppState {
     rate_limit_per_minute: u32,
     rate_limits: Arc<Mutex<HashMap<String, RateLimitBucket>>>,
     info_cache: Arc<Mutex<HashMap<PathBuf, Arc<ServerImageInfo>>>>,
+    viewer_prewarm_recent: Arc<Mutex<HashMap<PathBuf, Instant>>>,
+    inflight_response_renders: Arc<Mutex<HashMap<PathBuf, Arc<InflightResponseRender>>>>,
     metrics: Arc<AppMetrics>,
+}
+
+struct InflightResponseRender {
+    completed: Mutex<bool>,
+    condvar: Condvar,
+}
+
+struct InflightResponseRenderOwner {
+    map: Arc<Mutex<HashMap<PathBuf, Arc<InflightResponseRender>>>>,
+    key: PathBuf,
+    entry: Arc<InflightResponseRender>,
+}
+
+impl Drop for InflightResponseRenderOwner {
+    fn drop(&mut self) {
+        {
+            let mut completed = self
+                .entry
+                .completed
+                .lock()
+                .expect("inflight response mutex poisoned");
+            *completed = true;
+        }
+        {
+            let mut map = self
+                .map
+                .lock()
+                .expect("inflight response map mutex poisoned");
+            if map
+                .get(&self.key)
+                .is_some_and(|entry| Arc::ptr_eq(entry, &self.entry))
+            {
+                map.remove(&self.key);
+            }
+        }
+        self.entry.condvar.notify_all();
+    }
+}
+
+enum InflightResponseClaim {
+    Owner(InflightResponseRenderOwner),
+    Wait(Arc<InflightResponseRender>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -554,6 +602,8 @@ pub async fn run_from_cli() -> Result<()> {
         rate_limit_per_minute: cli.rate_limit_per_minute,
         rate_limits: Arc::new(Mutex::new(HashMap::new())),
         info_cache: Arc::new(Mutex::new(HashMap::new())),
+        viewer_prewarm_recent: Arc::new(Mutex::new(HashMap::new())),
+        inflight_response_renders: Arc::new(Mutex::new(HashMap::new())),
         metrics: Arc::new(AppMetrics::default()),
     });
 
@@ -1361,10 +1411,171 @@ async fn prewarm_cache(
     }
 }
 
-async fn viewer(AxumPath(id): AxumPath<String>) -> Response {
+#[derive(Clone, Copy)]
+enum ViewerPrewarmStatus {
+    Disabled,
+    InvalidId,
+    Scheduled,
+    SkippedRecent,
+}
+
+impl ViewerPrewarmStatus {
+    fn header_value(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::InvalidId => "invalid-id",
+            Self::Scheduled => "scheduled",
+            Self::SkippedRecent => "skipped-recent",
+        }
+    }
+}
+
+#[derive(Default, Deserialize)]
+struct ViewerQuery {
+    prewarm: Option<String>,
+}
+
+impl ViewerQuery {
+    fn prewarm_enabled(&self) -> bool {
+        self.prewarm
+            .as_deref()
+            .map(|value| {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    }
+}
+
+async fn maybe_spawn_viewer_prewarm(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    id: String,
+) -> ViewerPrewarmStatus {
+    if !response_cache_enabled(&state) {
+        return ViewerPrewarmStatus::Disabled;
+    }
+
+    let image_path = match resolve_id(&state.root, &id) {
+        Ok(path) => path,
+        Err(_) => return ViewerPrewarmStatus::InvalidId,
+    };
+
+    if !mark_viewer_prewarm_scheduled(&state, &image_path, Instant::now()) {
+        return ViewerPrewarmStatus::SkippedRecent;
+    }
+
+    tokio::spawn(async move {
+        let queue_started = Instant::now();
+        let guards = match acquire_render_guards(&state, &image_path, &headers).await {
+            Ok(guards) => guards,
+            Err(err) => {
+                eprintln!(
+                    "{}",
+                    json!({
+                        "event": "viewer_prewarm_failed",
+                        "stage": "queue",
+                        "error": err.to_string(),
+                    })
+                );
+                return;
+            }
+        };
+        record_queue_wait(&state.metrics, queue_started.elapsed());
+        let render_timeout = state.render_timeout;
+        let metrics = Arc::clone(&state.metrics);
+        let task_state = Arc::clone(&state);
+
+        let task = tokio::task::spawn_blocking(move || {
+            let _guards = guards;
+            task_state
+                .metrics
+                .render_active
+                .fetch_add(1, Ordering::Relaxed);
+            let result = prewarm_cache_blocking_with_profile(
+                &task_state,
+                id,
+                image_path,
+                CacheWarmProfile::ViewerFirstViewport,
+            );
+            task_state
+                .metrics
+                .render_active
+                .fetch_sub(1, Ordering::Relaxed);
+            result
+        });
+
+        let result = match tokio::time::timeout(render_timeout, task).await {
+            Ok(joined) => joined
+                .map_err(|err| anyhow!("viewer cache prewarm task failed: {err}"))
+                .and_then(|result| result),
+            Err(_) => {
+                metrics
+                    .render_timeouts_total
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(anyhow!(
+                    "viewer cache prewarm exceeded --render-timeout-sec ({}s)",
+                    render_timeout.as_secs()
+                ))
+            }
+        };
+
+        if let Err(err) = result {
+            eprintln!(
+                "{}",
+                json!({
+                    "event": "viewer_prewarm_failed",
+                    "stage": "render",
+                    "error": err.to_string(),
+                })
+            );
+        }
+    });
+
+    ViewerPrewarmStatus::Scheduled
+}
+
+fn mark_viewer_prewarm_scheduled(state: &AppState, image_path: &Path, now: Instant) -> bool {
+    let mut recent = state
+        .viewer_prewarm_recent
+        .lock()
+        .expect("viewer prewarm mutex poisoned");
+    recent.retain(|_, scheduled| {
+        now.checked_duration_since(*scheduled)
+            .is_some_and(|age| age < VIEWER_PREWARM_DEDUPE_WINDOW)
+    });
+    if recent.contains_key(image_path) {
+        return false;
+    }
+    if recent.len() >= VIEWER_PREWARM_RECENT_LIMIT {
+        let oldest = recent
+            .iter()
+            .min_by_key(|(_, scheduled)| **scheduled)
+            .map(|(path, _)| path.clone());
+        if let Some(oldest) = oldest {
+            recent.remove(&oldest);
+        }
+    }
+    recent.insert(image_path.to_path_buf(), now);
+    true
+}
+
+async fn viewer(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<ViewerQuery>,
+) -> Response {
+    let prewarm_status = if query.prewarm_enabled() {
+        maybe_spawn_viewer_prewarm(Arc::clone(&state), headers, id.clone()).await
+    } else {
+        ViewerPrewarmStatus::Disabled
+    };
     let encoded_id = encode_id(&id);
     let info_url = format!("/iiif/3/{encoded_id}/info.json");
-    Html(format!(
+    let mut response = Html(format!(
         r#"<!doctype html>
 <html lang="en">
 <head>
@@ -1472,7 +1683,12 @@ async fn viewer(AxumPath(id): AxumPath<String>) -> Response {
 </body>
 </html>"#
     ))
-    .into_response()
+    .into_response();
+    response.headers_mut().insert(
+        "x-gigatiff-viewer-prewarm",
+        HeaderValue::from_static(prewarm_status.header_value()),
+    );
+    response
 }
 
 async fn iiif(
@@ -1921,6 +2137,40 @@ fn record_response_timing(metrics: &AppMetrics, timing: ResponseTiming) {
     metrics
         .render_cache_prune_ms_total
         .fetch_add(duration_ms_u64(timing.cache_prune), Ordering::Relaxed);
+}
+
+fn claim_inflight_response_render(state: &AppState, key: &Path) -> InflightResponseClaim {
+    let mut map = state
+        .inflight_response_renders
+        .lock()
+        .expect("inflight response map mutex poisoned");
+    if let Some(entry) = map.get(key) {
+        return InflightResponseClaim::Wait(Arc::clone(entry));
+    }
+
+    let entry = Arc::new(InflightResponseRender {
+        completed: Mutex::new(false),
+        condvar: Condvar::new(),
+    });
+    map.insert(key.to_path_buf(), Arc::clone(&entry));
+    InflightResponseClaim::Owner(InflightResponseRenderOwner {
+        map: Arc::clone(&state.inflight_response_renders),
+        key: key.to_path_buf(),
+        entry,
+    })
+}
+
+fn wait_for_inflight_response_render(entry: &InflightResponseRender) {
+    let mut completed = entry
+        .completed
+        .lock()
+        .expect("inflight response mutex poisoned");
+    while !*completed {
+        completed = entry
+            .condvar
+            .wait(completed)
+            .expect("inflight response mutex poisoned");
+    }
 }
 
 fn record_decode_timing(
@@ -2572,6 +2822,7 @@ fn render_iiif_image(
         jp2_backend,
     );
 
+    let mut inflight_response_owner = None;
     let cache_path = if response_cache_enabled(state) {
         let path = response_cache_path(
             &state.cache_dir,
@@ -2583,35 +2834,10 @@ fn render_iiif_image(
             state,
             jp2_backend,
         )?;
-        let cache_read_start = Instant::now();
-        if let Some(bytes) = read_cached_response(state, &path)? {
-            timing.cache_read = cache_read_start.elapsed();
-            timing.total = total_start.elapsed();
-            record_cache_status(&state.metrics, "hit");
-            record_response_timing(&state.metrics, timing);
-            return Ok(RenderedResponse {
-                bytes,
-                content_type: content_type(&request.format),
-                cache_status: "hit",
-                canonical_path,
-                timing,
-                jp2_backend: jp2_backend.map(Jp2RenderBackend::label),
-                openjpeg_threads: jp2_openjpeg_threads,
-            });
-        }
-        if let Some(fallback_backend) = jp2_fallback_cache_backend {
-            let fallback_path = response_cache_path(
-                &state.cache_dir,
-                &image_path,
-                &info,
-                &canonical_path,
-                out_width,
-                out_height,
-                state,
-                Some(fallback_backend),
-            )?;
-            if let Some(bytes) = read_cached_response(state, &fallback_path)? {
-                timing.cache_read = cache_read_start.elapsed();
+        loop {
+            let cache_read_start = Instant::now();
+            if let Some(bytes) = read_cached_response(state, &path)? {
+                timing.cache_read += cache_read_start.elapsed();
                 timing.total = total_start.elapsed();
                 record_cache_status(&state.metrics, "hit");
                 record_response_timing(&state.metrics, timing);
@@ -2621,19 +2847,58 @@ fn render_iiif_image(
                     cache_status: "hit",
                     canonical_path,
                     timing,
-                    jp2_backend: Some(fallback_backend.label()),
-                    openjpeg_threads: selected_openjpeg_threads(
-                        state.openjpeg_threads,
-                        &info,
-                        rect,
-                        out_width,
-                        out_height,
-                        Some(fallback_backend),
-                    ),
+                    jp2_backend: jp2_backend.map(Jp2RenderBackend::label),
+                    openjpeg_threads: jp2_openjpeg_threads,
                 });
             }
+            if let Some(fallback_backend) = jp2_fallback_cache_backend {
+                let fallback_path = response_cache_path(
+                    &state.cache_dir,
+                    &image_path,
+                    &info,
+                    &canonical_path,
+                    out_width,
+                    out_height,
+                    state,
+                    Some(fallback_backend),
+                )?;
+                if let Some(bytes) = read_cached_response(state, &fallback_path)? {
+                    timing.cache_read += cache_read_start.elapsed();
+                    timing.total = total_start.elapsed();
+                    record_cache_status(&state.metrics, "hit");
+                    record_response_timing(&state.metrics, timing);
+                    return Ok(RenderedResponse {
+                        bytes,
+                        content_type: content_type(&request.format),
+                        cache_status: "hit",
+                        canonical_path,
+                        timing,
+                        jp2_backend: Some(fallback_backend.label()),
+                        openjpeg_threads: selected_openjpeg_threads(
+                            state.openjpeg_threads,
+                            &info,
+                            rect,
+                            out_width,
+                            out_height,
+                            Some(fallback_backend),
+                        ),
+                    });
+                }
+            }
+            timing.cache_read += cache_read_start.elapsed();
+
+            match claim_inflight_response_render(state, &path) {
+                InflightResponseClaim::Owner(owner) => {
+                    inflight_response_owner = Some(owner);
+                    break;
+                }
+                InflightResponseClaim::Wait(entry) => {
+                    let wait_start = Instant::now();
+                    wait_for_inflight_response_render(&entry);
+                    timing.cache_read += wait_start.elapsed();
+                }
+            }
         }
-        timing.cache_read = cache_read_start.elapsed();
         Some(path)
     } else {
         None
@@ -2728,6 +2993,7 @@ fn render_iiif_image(
     }
     record_cache_status(&state.metrics, cache_status);
     record_response_timing(&state.metrics, timing);
+    drop(inflight_response_owner);
     Ok(RenderedResponse {
         bytes,
         content_type,
@@ -2744,12 +3010,27 @@ fn prewarm_cache_blocking(
     id: String,
     image_path: PathBuf,
 ) -> Result<CacheWarmReport> {
+    prewarm_cache_blocking_with_profile(state, id, image_path, CacheWarmProfile::Default)
+}
+
+#[derive(Clone, Copy)]
+enum CacheWarmProfile {
+    Default,
+    ViewerFirstViewport,
+}
+
+fn prewarm_cache_blocking_with_profile(
+    state: &AppState,
+    id: String,
+    image_path: PathBuf,
+    profile: CacheWarmProfile,
+) -> Result<CacheWarmReport> {
     if !response_cache_enabled(state) {
         bail!("response cache is disabled");
     }
 
     let info = load_cached_info_blocking(state, &image_path)?;
-    let requests = prewarm_requests(&id, &info, state.tile_size);
+    let requests = prewarm_requests(&id, &info, state.tile_size, profile);
     let attempted = requests.len();
     let mut rendered = 0usize;
     let mut reports = Vec::with_capacity(attempted);
@@ -2787,32 +3068,72 @@ fn prewarm_cache_blocking(
     })
 }
 
-fn prewarm_requests(id: &str, info: &ServerImageInfo, tile_size: u32) -> Vec<IiifImageRequest> {
-    let tile_width = tile_size.min(info.width).max(1);
-    let tile_height = tile_size.min(info.height).max(1);
+fn prewarm_requests(
+    id: &str,
+    info: &ServerImageInfo,
+    tile_size: u32,
+    profile: CacheWarmProfile,
+) -> Vec<IiifImageRequest> {
+    let (advertised_tile_width, advertised_tile_height) = advertised_tile_size(tile_size, info);
+    let tile_width = advertised_tile_width.min(info.width).max(1);
+    let tile_height = advertised_tile_height.min(info.height).max(1);
     let thumbnail_size = if info.width <= 512 && info.height <= 512 {
         "max".to_string()
     } else {
         "!512,512".to_string()
     };
-    vec![
-        IiifImageRequest {
-            id: id.to_string(),
-            region: "full".to_string(),
-            size: thumbnail_size,
-            rotation: "0".to_string(),
-            quality: "default".to_string(),
-            format: ImageFormat::Webp,
-        },
-        IiifImageRequest {
-            id: id.to_string(),
-            region: format!("0,0,{tile_width},{tile_height}"),
-            size: format!("{tile_width},{tile_height}"),
-            rotation: "0".to_string(),
-            quality: "default".to_string(),
-            format: ImageFormat::Webp,
-        },
-    ]
+    let thumbnail = IiifImageRequest {
+        id: id.to_string(),
+        region: "full".to_string(),
+        size: thumbnail_size,
+        rotation: "0".to_string(),
+        quality: "default".to_string(),
+        format: ImageFormat::Webp,
+    };
+
+    match profile {
+        CacheWarmProfile::Default => {
+            let mut requests = vec![thumbnail];
+            requests.push(prewarm_tile_request(id, 0, 0, tile_width, tile_height));
+            requests
+        }
+        CacheWarmProfile::ViewerFirstViewport => {
+            let mut requests = Vec::new();
+            let columns = VIEWER_PREWARM_WIDTH.div_ceil(tile_width).max(1);
+            let rows = VIEWER_PREWARM_HEIGHT.div_ceil(tile_height).max(1);
+            for row in 0..rows {
+                for column in 0..columns {
+                    let x = column.saturating_mul(tile_width);
+                    let y = row.saturating_mul(tile_height);
+                    if x >= info.width || y >= info.height {
+                        continue;
+                    }
+                    let region_width = tile_width.min(info.width - x).max(1);
+                    let region_height = tile_height.min(info.height - y).max(1);
+                    requests.push(prewarm_tile_request(id, x, y, region_width, region_height));
+                }
+            }
+            requests.push(thumbnail);
+            requests
+        }
+    }
+}
+
+fn prewarm_tile_request(
+    id: &str,
+    x: u32,
+    y: u32,
+    region_width: u32,
+    region_height: u32,
+) -> IiifImageRequest {
+    IiifImageRequest {
+        id: id.to_string(),
+        region: format!("{x},{y},{region_width},{region_height}"),
+        size: format!("{region_width},{region_height}"),
+        rotation: "0".to_string(),
+        quality: "default".to_string(),
+        format: ImageFormat::Webp,
+    }
 }
 
 fn response_cache_path(
@@ -5673,13 +5994,61 @@ mod tests {
     #[test]
     fn prewarm_requests_include_thumbnail_and_first_tile() {
         let info = ServerImageInfo::from_tiff(dummy_info());
-        let requests = prewarm_requests("map.tif", &info, 512);
+        let requests = prewarm_requests("map.tif", &info, 512, CacheWarmProfile::Default);
 
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].region, "full");
         assert_eq!(requests[0].size, "!512,512");
         assert_eq!(requests[1].region, "0,0,512,512");
         assert_eq!(requests[1].format.extension(), "webp");
+    }
+
+    #[test]
+    fn viewer_prewarm_requests_cover_first_viewport() {
+        let info = ServerImageInfo::from_tiff(dummy_info());
+        let requests =
+            prewarm_requests("map.tif", &info, 512, CacheWarmProfile::ViewerFirstViewport);
+
+        assert_eq!(requests.len(), 9);
+        assert_eq!(requests[0].region, "0,0,512,512");
+        assert_eq!(requests[3].region, "1536,0,512,512");
+        assert_eq!(requests[7].region, "1536,512,512,512");
+        assert_eq!(requests[8].region, "full");
+    }
+
+    #[cfg(any(feature = "jpeg2000-grok", feature = "jpeg2000-openjpeg-ffi"))]
+    #[test]
+    fn default_prewarm_uses_advertised_large_jpeg2000_tile() {
+        let info = ServerImageInfo {
+            width: 5000,
+            height: 3000,
+            source: ServerImageSource::Jpeg2000(Jpeg2000Info {
+                tile_width: Some(4096),
+                tile_height: Some(4096),
+                precision: Some(8),
+                ..Jpeg2000Info::default()
+            }),
+        };
+        let requests = prewarm_requests("map.jp2", &info, 512, CacheWarmProfile::Default);
+
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].region, "0,0,1024,1024");
+        assert_eq!(requests[1].size, "1024,1024");
+    }
+
+    #[test]
+    fn viewer_prewarm_dedupe_skips_recent_path() {
+        let state = dummy_state(unique_temp_dir("viewer-prewarm"));
+        let path = Path::new("map.tif");
+        let now = Instant::now();
+
+        assert!(mark_viewer_prewarm_scheduled(&state, path, now));
+        assert!(!mark_viewer_prewarm_scheduled(&state, path, now));
+        assert!(mark_viewer_prewarm_scheduled(
+            &state,
+            path,
+            now + VIEWER_PREWARM_DEDUPE_WINDOW + Duration::from_secs(1)
+        ));
     }
 
     #[test]
@@ -5969,6 +6338,8 @@ mod tests {
             rate_limit_per_minute: 600,
             rate_limits: Arc::new(Mutex::new(HashMap::new())),
             info_cache: Arc::new(Mutex::new(HashMap::new())),
+            viewer_prewarm_recent: Arc::new(Mutex::new(HashMap::new())),
+            inflight_response_renders: Arc::new(Mutex::new(HashMap::new())),
             metrics: Arc::new(AppMetrics::default()),
         }
     }

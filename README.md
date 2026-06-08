@@ -240,6 +240,7 @@ POST /api/cache/warm/<image-id>
 GET /api/info/<image-id>
 GET /metrics
 GET /viewer/<image-id>
+GET /viewer/<image-id>?prewarm=1
 GET /iiif/3/<image-id>
 GET /iiif/3/<image-id>/info.json
 GET /iiif/3/<image-id>/<region>/<size>/<rotation>/<quality>.<format>
@@ -264,6 +265,19 @@ such as valid2000, JHOVE, or jpylyzer.
 /api/cache/warm/<image-id>` pre-renders a small default warm set: a full-image WebP thumbnail and the
 first advertised WebP tile/region. This is intentionally conservative; future production deployments
 can extend the same API toward queue-based prewarming and Dragonfly/Redis-backed shared cache storage.
+
+`GET /viewer/<image-id>?prewarm=1` is an opt-in browser-viewer warm path. It returns the normal
+OpenSeadragon HTML, schedules a background cache warm for the first 2048 x 1024 viewport using the
+advertised IIIF tile geometry, and marks the response with `x-gigatiff-viewer-prewarm:
+scheduled|skipped-recent|disabled|invalid-id`. The default `/viewer/<image-id>` route leaves this
+disabled because immediate prewarming with no lead time can compete with the first visible tile
+requests. It is most useful when triggered before navigation, for example from an image-list hover,
+an "open warmed viewer" action, or a queue that warms likely next images.
+
+Identical encoded response cache misses are coalesced in-process. When two requests race for the
+same cache key, one render stores the bytes while the other waits and rechecks the cache. This avoids
+duplicated expensive JP2 fallback renders during prewarm/viewer overlap and bursty OpenSeadragon
+startup.
 
 `GET /metrics` exposes Prometheus text-format metrics. The server records HTTP request/response
 counters, rate-limited request counts, cache hits/misses/disabled responses and hit ratio, cache size
@@ -471,6 +485,8 @@ not a single tile, but the first OpenSeadragon viewport worth of advertised tile
 The helper records cold/warm `info.json`, metadata, thumbnail, fixed tile, advertised tile, and
 startup-viewport batches. It also stores cache state, JP2 backend, server timing headers, HTTP
 status, and any error text so failed OpenJPEG/Grok requests remain part of the benchmark record.
+`-ViewerPrewarmDelayMs` additionally measures the opt-in viewer prewarm path by loading
+`/viewer/<id>?prewarm=1`, waiting for the configured delay, and then requesting the startup viewport.
 
 ## libtiff
 
@@ -1008,6 +1024,35 @@ openjpeg threads  path                         image                            
 1                 adaptive parallel conversion mapa2_user_1_8.jp2                             381.3 ms
 ```
 
+The next first-load experiment added an opt-in viewer prewarm profile and in-process coalescing for
+identical response-cache misses. The prewarm profile renders the first 2048 x 1024 viewport tiles
+before the thumbnail, using the advertised tile size. With a 3 second lead time, this turns the
+startup viewport into cache hits and makes the visible first view much faster:
+
+```text
+image                              baseline startup wall  prewarmed startup wall  lead time
+mapa2_no_xmp_clean_master.jp2                  1158.4 ms                 94.0 ms  3000 ms
+mapa2_master.jp2                               2038.3 ms                376.8 ms  3000 ms
+mapa2_no_xmp_clean_user_1_8.jp2                 347.6 ms                111.2 ms  3000 ms
+mapa2_user_1_8.jp2                              437.6 ms                 95.5 ms  3000 ms
+```
+
+The same benchmark with zero lead time showed why this path is opt-in instead of automatic on every
+viewer open. Coalescing prevented duplicate renders (`x-gigatiff-render-ms` was `0` on the waiting
+startup-viewport requests), but the viewport still waited for the prewarm owner and was slower than
+letting OpenSeadragon make the first visible requests directly:
+
+```text
+image                              baseline startup wall  prewarm delay 0 wall  note
+mapa2_no_xmp_clean_master.jp2                  1463.1 ms              2107.5 ms  coalesced wait
+mapa2_master.jp2                               2045.5 ms              2860.0 ms  coalesced wait
+```
+
+The useful product direction is therefore earlier prewarm triggers, such as the image index, hover or
+focus events, explicit warm/open actions, or a production prewarm queue. The server-side coalescing
+still helps under burst load because it prevents multiple workers from decoding the same expensive
+response at once.
+
 Small WebP tile-size smoke run after the `pct:` IIIF update
 (`-ImageIds mapa2_no_xmp_clean.tif -Formats webp -OutputSizes 128,256 -Iterations 2 -Parallel 2 -ClearCache`):
 
@@ -1171,6 +1216,10 @@ Useful next steps for the image server:
   gray-grid output for 4096 x 4096 RPCL master codestreams,
 - tune the direct OpenJPEG FFI path further, especially adaptive thread count, reduction choice, and
   component conversion cost,
+- add earlier first-load prewarm triggers for the web UI, starting with image-list hover/focus and an
+  explicit warm/open action, then measure browser time-to-first-visible-tile,
+- expose request coalescing and viewer-prewarm counters in `/metrics`, so production runs can show
+  how often prewarm helps, skips, waits, or races visible requests,
 - investigate why lower-rate JP2 user-copy region requests are slower through FFI than through the
   CLI backend, especially around Grok reduction/update behavior and component copy cost,
 - benchmark full-image JP2 thumbnails separately from tile/region requests and tune reduction

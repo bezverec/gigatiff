@@ -10,6 +10,7 @@ param(
     [int]$BatchCount = 8,
     [int]$StartupViewportWidth = 2048,
     [int]$StartupViewportHeight = 1024,
+    [int]$ViewerPrewarmDelayMs = 1000,
     [string]$OutDir = "target/server-benchmarks-jp2",
     [switch]$SkipCachePurge,
     [switch]$Json
@@ -75,6 +76,7 @@ function Invoke-TimedRequest {
             Cache = Get-HeaderString $response.Headers "x-gigatiff-cache"
             Jp2Backend = Get-HeaderString $response.Headers "x-gigatiff-jp2-backend"
             OpenJpegThreads = Get-HeaderString $response.Headers "x-gigatiff-openjpeg-threads"
+            ViewerPrewarm = Get-HeaderString $response.Headers "x-gigatiff-viewer-prewarm"
             Jp2TileWidth = Get-HeaderString $response.Headers "x-gigatiff-jp2-tile-width"
             Jp2TileHeight = Get-HeaderString $response.Headers "x-gigatiff-jp2-tile-height"
             Jp2TilesSupported = Get-HeaderString $response.Headers "x-gigatiff-jp2-tiles-supported"
@@ -100,6 +102,7 @@ function Invoke-TimedRequest {
             Cache = $null
             Jp2Backend = $null
             OpenJpegThreads = $null
+            ViewerPrewarm = $null
             Jp2TileWidth = $null
             Jp2TileHeight = $null
             Jp2TilesSupported = $null
@@ -199,6 +202,7 @@ function Measure-Batch {
                     Cache = & $header $response.Headers "x-gigatiff-cache"
                     Jp2Backend = & $header $response.Headers "x-gigatiff-jp2-backend"
                     OpenJpegThreads = & $header $response.Headers "x-gigatiff-openjpeg-threads"
+                    ViewerPrewarm = & $header $response.Headers "x-gigatiff-viewer-prewarm"
                     ServerTotalMs = & $doubleHeader $response.Headers "x-gigatiff-total-ms"
                     ServerRenderMs = & $doubleHeader $response.Headers "x-gigatiff-render-ms"
                     ServerEncodeMs = & $doubleHeader $response.Headers "x-gigatiff-encode-ms"
@@ -215,6 +219,7 @@ function Measure-Batch {
                     Cache = $null
                     Jp2Backend = $null
                     OpenJpegThreads = $null
+                    ViewerPrewarm = $null
                     ServerTotalMs = $null
                     ServerRenderMs = $null
                     ServerEncodeMs = $null
@@ -249,6 +254,7 @@ function Measure-Batch {
         Cache = (($rows | ForEach-Object Cache | Sort-Object -Unique) -join ",")
         Jp2Backend = (($rows | ForEach-Object Jp2Backend | Sort-Object -Unique) -join ",")
         OpenJpegThreads = (($rows | ForEach-Object OpenJpegThreads | Sort-Object -Unique) -join ",")
+        ViewerPrewarm = (($rows | ForEach-Object ViewerPrewarm | Sort-Object -Unique) -join ",")
         Jp2TileWidth = $null
         Jp2TileHeight = $null
         Jp2TilesSupported = $null
@@ -332,6 +338,14 @@ foreach ($imageId in $ImageIds) {
         }
     }
     $rows.Add((Measure-Batch -Urls @($urls | Where-Object { $_ }) -ImageId $imageId -Scenario "startup_viewport_advertised_tile")) | Out-Null
+
+    Invoke-CachePurge -BaseUrl $BaseUrl -EncodedId $encodedId
+    $viewerUrl = "$BaseUrl/viewer/$encodedId`?prewarm=1"
+    $rows.Add((Invoke-TimedRequest -Url $viewerUrl -Scenario "viewer_html_prewarm" -ImageId $imageId -Phase "trigger")) | Out-Null
+    if ($ViewerPrewarmDelayMs -gt 0) {
+        Start-Sleep -Milliseconds $ViewerPrewarmDelayMs
+    }
+    $rows.Add((Measure-Batch -Urls @($urls | Where-Object { $_ }) -ImageId $imageId -Scenario "viewer_prewarmed_startup_viewport")) | Out-Null
 }
 
 if (-not [string]::IsNullOrWhiteSpace($OutDir)) {
@@ -346,6 +360,7 @@ if (-not [string]::IsNullOrWhiteSpace($OutDir)) {
         BatchCount = $BatchCount
         StartupViewportWidth = $StartupViewportWidth
         StartupViewportHeight = $StartupViewportHeight
+        ViewerPrewarmDelayMs = $ViewerPrewarmDelayMs
         SkipCachePurge = [bool]$SkipCachePurge
         Metadata = $metadata.ToArray()
         Results = $rows.ToArray()
@@ -366,5 +381,5 @@ if ($Json) {
         Results = $rows.ToArray()
     } | ConvertTo-Json -Depth 6
 } else {
-    $rows | Select-Object Image,Scenario,Phase,Status,Ms,ServerTotalMs,ServerRenderMs,ServerEncodeMs,Cache,Jp2Backend,Bytes,Error | Format-Table -AutoSize
+    $rows | Select-Object Image,Scenario,Phase,Status,Ms,ServerTotalMs,ServerRenderMs,ServerEncodeMs,Cache,Jp2Backend,OpenJpegThreads,ViewerPrewarm,Bytes,Error | Format-Table -AutoSize
 }
