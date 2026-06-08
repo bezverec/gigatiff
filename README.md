@@ -285,7 +285,7 @@ spending GitHub Actions minutes on every push.
 ### Server Benchmarks
 
 The first server benchmark helper measures cold/warm tile requests, cache headers, server-side timing
-headers, output size, and a simple parallel batch:
+headers, cold render/encode/cache-store phases, output size, and a simple parallel batch:
 
 ```powershell
 .\scripts\bench-server.ps1 -BaseUrl http://127.0.0.1:18082 -Iterations 5 -Parallel 8
@@ -669,11 +669,61 @@ mapa2_user_1_8.jp2             42.2  55.2   58.8  72.1 ms
 ```
 
 After the OpenJPEG fallback was added for 4096 x 4096 tiled master JP2 files, the same master regions
-render as continuous image data instead of sparse gray-grid output. A local smoke request for
-`mapa2_master.jp2/0,0,4096,4096/513,/0/default.png` through Docker/Caddy returned a cache miss with
-`x-gigatiff-render-ms: 1860.45`, `x-gigatiff-total-ms: 2044.21`, and a 687 KiB PNG. A repeated
-request for the same canonical tile was served from the persistent encoded response cache in about
-5 ms. The tradeoff is deliberate: large master JP2 cold tiles are slower, but correct and cacheable.
+render as continuous image data instead of sparse gray-grid output. The current Docker/Caddy
+benchmark was run against `http://127.0.0.1:18082` with a purged persistent response cache, JPEG
+output, 512 px output size, three warm iterations, and a parallel batch size of four:
+
+```powershell
+.\scripts\bench-server.ps1 -BaseUrl http://127.0.0.1:18082 `
+    -ImageIds mapa2_no_xmp_clean.tif,mapa2.tif,mapa2_no_xmp_clean_master.jp2,mapa2_master.jp2,mapa2_no_xmp_clean_user_1_8.jp2,mapa2_user_1_8.jp2 `
+    -Formats jpg -RegionSizes 512,4096 -OutputSizes 512 `
+    -Iterations 3 -Parallel 4 -PurgeServerCache `
+    -OutDir target\server-benchmarks
+```
+
+```text
+image                            region  cold render  cold total  warm avg  bytes
+mapa2_no_xmp_clean.tif              512      53.8 ms     88.7 ms   11.6 ms   41954
+mapa2_no_xmp_clean.tif             4096      74.3 ms     92.7 ms   13.2 ms   96871
+mapa2.tif                           512      90.8 ms    109.2 ms   10.6 ms   39456
+mapa2.tif                          4096     112.0 ms    133.5 ms   14.1 ms  101519
+mapa2_no_xmp_clean_master.jp2       512    1269.4 ms   1295.9 ms   10.5 ms   41954
+mapa2_no_xmp_clean_master.jp2      4096    1077.0 ms   1150.6 ms   11.0 ms   96265
+mapa2_master.jp2                    512    1744.8 ms   1762.0 ms    8.5 ms   39382
+mapa2_master.jp2                   4096    1818.1 ms   1841.3 ms   12.3 ms  101172
+mapa2_no_xmp_clean_user_1_8.jp2     512      42.0 ms     60.7 ms   13.5 ms   40604
+mapa2_no_xmp_clean_user_1_8.jp2    4096      54.9 ms     77.6 ms   10.9 ms   78848
+mapa2_user_1_8.jp2                  512      54.0 ms     73.3 ms   10.7 ms   76327
+mapa2_user_1_8.jp2                 4096      73.1 ms    106.1 ms   10.4 ms   83045
+```
+
+The tradeoff is deliberate: large master JP2 cold tiles are slower through OpenJPEG, but correct and
+cacheable. Warm-cache responses stay around 9-14 ms client-side because they come from the encoded
+response cache instead of re-running JPEG2000 decode.
+
+The same 4096 -> 512 request shape was also run across JPEG, PNG, and lossless WebP output formats:
+
+```text
+image                            fmt   cold render  cold total  warm avg   bytes
+mapa2_no_xmp_clean.tif           jpg       60.1 ms    106.5 ms   11.1 ms   96871
+mapa2_no_xmp_clean.tif           png       69.7 ms    103.8 ms   25.8 ms  666518
+mapa2_no_xmp_clean.tif           webp      69.8 ms    105.9 ms   24.2 ms  501468
+mapa2.tif                        jpg      113.1 ms    133.8 ms   12.6 ms  101519
+mapa2.tif                        png      117.8 ms    157.1 ms   30.4 ms  669429
+mapa2.tif                        webp     110.4 ms    151.0 ms   30.2 ms  521496
+mapa2_no_xmp_clean_master.jp2    jpg     1113.9 ms   1136.5 ms   16.6 ms   96265
+mapa2_no_xmp_clean_master.jp2    png     1131.2 ms   1168.9 ms   27.9 ms  678752
+mapa2_no_xmp_clean_master.jp2    webp    1183.4 ms   1208.0 ms   19.8 ms  472178
+mapa2_master.jp2                 jpg     1650.5 ms   1675.0 ms   12.7 ms  101172
+mapa2_master.jp2                 png     1653.7 ms   1683.5 ms   29.0 ms  678042
+mapa2_master.jp2                 webp    1586.2 ms   1615.1 ms   18.2 ms  494528
+mapa2_no_xmp_clean_user_1_8.jp2  jpg       54.4 ms     74.0 ms   10.8 ms   78848
+mapa2_no_xmp_clean_user_1_8.jp2  png       57.0 ms     87.8 ms   21.3 ms  584966
+mapa2_no_xmp_clean_user_1_8.jp2  webp      57.2 ms     83.8 ms   18.6 ms  407142
+mapa2_user_1_8.jp2               jpg       70.4 ms     96.7 ms   10.2 ms   83045
+mapa2_user_1_8.jp2               png       70.9 ms    104.6 ms   17.9 ms  585963
+mapa2_user_1_8.jp2               webp      71.0 ms     94.4 ms   18.6 ms  431200
+```
 
 Full-image JPEG2000 thumbnails are where the FFI backend provides a functional advantage for small
 tile/user-copy JP2 files. In this run, the CLI backend failed all tested `full/512,` JP2 requests

@@ -194,8 +194,15 @@ foreach ($imageId in $ImageIds) {
                     OutputSize = $outputSizeValue
                     ColdMs = $first.Ms
                     ColdCache = $first.Cache
+                    ColdServerMs = $first.ServerTotalMs
+                    ColdRenderMs = $first.ServerRenderMs
+                    ColdEncodeMs = $first.ServerEncodeMs
+                    ColdCacheStoreMs = $first.ServerCacheStoreMs
+                    ColdCachePruneMs = $first.ServerCachePruneMs
                     WarmProbeMs = $second.Ms
                     WarmProbeCache = $second.Cache
+                    WarmProbeServerMs = $second.ServerTotalMs
+                    WarmProbeCacheReadMs = $second.ServerCacheReadMs
                     WarmAvgMs = $warmStats.AvgMs
                     WarmServerAvgMs = $warmStats.ServerAvgMs
                     WarmRenderAvgMs = $warmStats.ServerRenderAvgMs
