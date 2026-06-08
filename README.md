@@ -962,6 +962,24 @@ The single-tile timings were not uniformly best at four threads, but the real fi
 was best at `--openjpeg-threads 4` on this machine. The CLI default remains conservative at `1`, while
 Docker/ops examples set `GIGATIFF_OPENJPEG_THREADS=4` as the current large-JP2 starting point.
 
+OpenJPEG FFI component-to-RGBA conversion now uses a parallel row path only when the OpenJPEG decode
+itself is single-threaded. The first attempt also parallelized conversion while OpenJPEG was using
+four internal decode threads, but that hurt first-viewport wall time through CPU contention. The
+kept path is therefore adaptive: it helps the conservative `--openjpeg-threads 1` mode and stays
+disabled for the Docker `--openjpeg-threads 4` default.
+
+```text
+openjpeg threads  path                         image                              startup viewport wall
+1                 before parallel conversion   mapa2_no_xmp_clean_master.jp2                  1795.7 ms
+1                 adaptive parallel conversion mapa2_no_xmp_clean_master.jp2                  1612.2 ms
+1                 before parallel conversion   mapa2_master.jp2                               2063.0 ms
+1                 adaptive parallel conversion mapa2_master.jp2                               1906.3 ms
+1                 before parallel conversion   mapa2_no_xmp_clean_user_1_8.jp2                411.1 ms
+1                 adaptive parallel conversion mapa2_no_xmp_clean_user_1_8.jp2                373.7 ms
+1                 before parallel conversion   mapa2_user_1_8.jp2                             436.0 ms
+1                 adaptive parallel conversion mapa2_user_1_8.jp2                             381.3 ms
+```
+
 Small WebP tile-size smoke run after the `pct:` IIIF update
 (`-ImageIds mapa2_no_xmp_clean.tif -Formats webp -OutputSizes 128,256 -Iterations 2 -Parallel 2 -ClearCache`):
 

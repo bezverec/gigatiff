@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use lcms2::{DisallowCache, Flags, GlobalContext, Intent, PixelFormat, Profile, Transform};
 use openjpeg_sys as opj;
+use rayon::prelude::*;
 
 use crate::render::Rect;
 
@@ -61,7 +62,7 @@ pub fn render_region(
     let decode = decode_start.elapsed();
 
     let convert_start = Instant::now();
-    let (width, height, rgba) = unsafe { image_to_rgba(decoder.image)? };
+    let (width, height, rgba) = unsafe { image_to_rgba(decoder.image, threads.max(1))? };
     let convert = convert_start.elapsed();
 
     Ok(OpenJpegBitmap {
@@ -215,7 +216,10 @@ unsafe fn info_from_image(image: *mut opj::opj_image_t) -> Result<OpenJpegInfo> 
     })
 }
 
-unsafe fn image_to_rgba(image: *mut opj::opj_image_t) -> Result<(u32, u32, Vec<u8>)> {
+unsafe fn image_to_rgba(
+    image: *mut opj::opj_image_t,
+    decode_threads: i32,
+) -> Result<(u32, u32, Vec<u8>)> {
     if image.is_null() {
         bail!("OpenJPEG returned a null image");
     }
@@ -238,23 +242,103 @@ unsafe fn image_to_rgba(image: *mut opj::opj_image_t) -> Result<(u32, u32, Vec<u
         return Ok((width, height, rgba));
     }
 
-    for y in 0..height as usize {
-        for x in 0..width as usize {
-            let dst = (y * width as usize + x) * 4;
-            if comps.len() >= 3 {
-                rgba[dst] = component_sample_to_u8(&comps[0], x, y, width, height)?;
-                rgba[dst + 1] = component_sample_to_u8(&comps[1], x, y, width, height)?;
-                rgba[dst + 2] = component_sample_to_u8(&comps[2], x, y, width, height)?;
-            } else {
-                let gray = component_sample_to_u8(&comps[0], x, y, width, height)?;
-                rgba[dst] = gray;
-                rgba[dst + 1] = gray;
-                rgba[dst + 2] = gray;
-            }
+    let component_views = component_views(comps)?;
+    let row_len = width as usize * 4;
+    if should_parallel_component_convert(width, height, decode_threads) {
+        rgba.par_chunks_mut(row_len)
+            .enumerate()
+            .try_for_each(|(y, row)| {
+                write_component_row(&component_views, y, width, height, row)
+            })?;
+    } else {
+        for (y, row) in rgba.chunks_mut(row_len).enumerate() {
+            write_component_row(&component_views, y, width, height, row)?;
         }
     }
 
     Ok((width, height, rgba))
+}
+
+#[derive(Clone, Copy)]
+struct ComponentView {
+    data_addr: usize,
+    width: u32,
+    height: u32,
+    precision: u32,
+    signed: bool,
+}
+
+fn component_views(components: &[opj::opj_image_comp_t]) -> Result<Vec<ComponentView>> {
+    components
+        .iter()
+        .map(|component| {
+            if component.data.is_null() || component.w == 0 || component.h == 0 {
+                bail!("OpenJPEG returned a component without sample data");
+            }
+            Ok(ComponentView {
+                data_addr: component.data as usize,
+                width: component.w,
+                height: component.h,
+                precision: component.prec,
+                signed: component.sgnd != 0,
+            })
+        })
+        .collect()
+}
+
+fn should_parallel_component_convert(width: u32, height: u32, decode_threads: i32) -> bool {
+    decode_threads <= 1
+        && width as usize * height as usize >= 256 * 256
+        && rayon::current_num_threads() > 1
+}
+
+fn write_component_row(
+    components: &[ComponentView],
+    y: usize,
+    width: u32,
+    height: u32,
+    row: &mut [u8],
+) -> Result<()> {
+    if components.len() >= 3 {
+        for (x, rgba) in row.chunks_exact_mut(4).enumerate() {
+            rgba[0] = component_view_sample_to_u8(&components[0], x, y, width, height)?;
+            rgba[1] = component_view_sample_to_u8(&components[1], x, y, width, height)?;
+            rgba[2] = component_view_sample_to_u8(&components[2], x, y, width, height)?;
+            rgba[3] = 255;
+        }
+    } else {
+        let component = components
+            .first()
+            .ok_or_else(|| anyhow!("OpenJPEG returned an image without components"))?;
+        for (x, rgba) in row.chunks_exact_mut(4).enumerate() {
+            let gray = component_view_sample_to_u8(component, x, y, width, height)?;
+            rgba[0] = gray;
+            rgba[1] = gray;
+            rgba[2] = gray;
+            rgba[3] = 255;
+        }
+    }
+    Ok(())
+}
+
+fn component_view_sample_to_u8(
+    component: &ComponentView,
+    x: usize,
+    y: usize,
+    out_width: u32,
+    out_height: u32,
+) -> Result<u8> {
+    let cx = (x as u64 * component.width as u64 / out_width as u64)
+        .min(component.width.saturating_sub(1) as u64) as usize;
+    let cy = (y as u64 * component.height as u64 / out_height as u64)
+        .min(component.height.saturating_sub(1) as u64) as usize;
+    let index = cy
+        .checked_mul(component.width as usize)
+        .and_then(|base| base.checked_add(cx))
+        .ok_or_else(|| anyhow!("OpenJPEG component index overflow"))?;
+    let data = component.data_addr as *const i32;
+    let sample = unsafe { *data.add(index) };
+    Ok(sample_to_u8(sample, component.precision, component.signed))
 }
 
 enum OpenJpegColorTransform {
@@ -397,24 +481,6 @@ impl OpenJpegColorTransform {
             Self::Gray16(_) | Self::Rgb16(_) => 2,
         }
     }
-}
-
-fn component_sample_to_u8(
-    component: &opj::opj_image_comp_t,
-    x: usize,
-    y: usize,
-    out_width: u32,
-    out_height: u32,
-) -> Result<u8> {
-    if component.data.is_null() || component.w == 0 || component.h == 0 {
-        bail!("OpenJPEG returned a component without sample data");
-    }
-    let cx = (x as u64 * component.w as u64 / out_width as u64)
-        .min(component.w.saturating_sub(1) as u64) as usize;
-    let cy = (y as u64 * component.h as u64 / out_height as u64)
-        .min(component.h.saturating_sub(1) as u64) as usize;
-    let sample = component_sample(component, cx, cy, component.w, component.h)?;
-    Ok(sample_to_u8(sample, component.prec, component.sgnd != 0))
 }
 
 fn component_sample(
