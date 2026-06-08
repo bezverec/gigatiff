@@ -1532,9 +1532,10 @@ async fn iiif_info(state: Arc<AppState>, headers: HeaderMap, id: String) -> Resp
     });
 
     if should_advertise_tiles(&info) {
+        let (tile_width, tile_height) = advertised_tile_size(state.tile_size, &info);
         body["tiles"] = json!([{
-            "width": state.tile_size,
-            "height": state.tile_size,
+            "width": tile_width,
+            "height": tile_height,
             "scaleFactors": scale_factors(info.width, info.height)
         }]);
     }
@@ -4873,6 +4874,19 @@ fn should_advertise_tiles(info: &ServerImageInfo) -> bool {
     }
 }
 
+fn advertised_tile_size(configured_tile_size: u32, _info: &ServerImageInfo) -> (u32, u32) {
+    #[cfg(any(feature = "jpeg2000-grok", feature = "jpeg2000-openjpeg-ffi"))]
+    if configured_tile_size == 512 {
+        if let ServerImageSource::Jpeg2000(jpeg2000) = &_info.source {
+            if should_use_openjpeg_fallback(jpeg2000) {
+                return (1024, 1024);
+            }
+        }
+    }
+
+    (configured_tile_size, configured_tile_size)
+}
+
 fn error_response(status: StatusCode, err: anyhow::Error) -> Response {
     if std::env::var_os("GIGATIFF_VERBOSE_ERRORS").is_none() {
         return (status, err.to_string()).into_response();
@@ -5550,6 +5564,13 @@ mod tests {
     }
 
     #[test]
+    fn advertised_tile_size_keeps_configured_tiff_size() {
+        let info = ServerImageInfo::from_tiff(dummy_info());
+        assert_eq!(advertised_tile_size(512, &info), (512, 512));
+        assert_eq!(advertised_tile_size(1024, &info), (1024, 1024));
+    }
+
+    #[test]
     fn metadata_response_includes_tiff_technical_fields() {
         let info = ServerImageInfo::from_tiff(dummy_info());
 
@@ -5644,6 +5665,23 @@ mod tests {
             }),
         };
         assert!(should_advertise_tiles(&info));
+    }
+
+    #[cfg(any(feature = "jpeg2000-grok-ffi", feature = "jpeg2000-openjpeg-ffi"))]
+    #[test]
+    fn large_tile_jpeg2000_uses_larger_default_advertised_tiles() {
+        let info = ServerImageInfo {
+            width: 41174,
+            height: 29077,
+            source: ServerImageSource::Jpeg2000(Jpeg2000Info {
+                tile_width: Some(4096),
+                tile_height: Some(4096),
+                precision: Some(8),
+                ..Jpeg2000Info::default()
+            }),
+        };
+        assert_eq!(advertised_tile_size(512, &info), (1024, 1024));
+        assert_eq!(advertised_tile_size(2048, &info), (2048, 2048));
     }
 
     #[cfg(feature = "jpeg2000-grok")]

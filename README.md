@@ -446,6 +446,20 @@ the Docker/Caddy stack. `-OutDir` writes both JSON and CSV artefacts:
 Use `-ClearCache` when you want to delete files under a local cache directory instead of using the
 HTTP purge endpoint. Add `-Json` when another script should consume the table directly from stdout.
 
+JPEG2000 first-load experiments use a dedicated helper because the important user-visible path is
+not a single tile, but the first OpenSeadragon viewport worth of advertised tiles:
+
+```powershell
+.\scripts\bench-jp2-firstload.ps1 -BaseUrl http://127.0.0.1:18082 `
+    -ImageIds mapa2_no_xmp_clean_master.jp2,mapa2_master.jp2 `
+    -BatchCount 8 `
+    -OutDir target\server-benchmarks-jp2
+```
+
+The helper records cold/warm `info.json`, metadata, thumbnail, fixed tile, advertised tile, and
+startup-viewport batches. It also stores cache state, JP2 backend, server timing headers, HTTP
+status, and any error text so failed OpenJPEG/Grok requests remain part of the benchmark record.
+
 ## libtiff
 
 The build script links against libtiff through a platform-specific discovery path.
@@ -898,6 +912,29 @@ compiles upstream Grok and generates Rust bindings against the installed `grok.h
 large-tile master fallback. The benefit is that ordinary JPEG2000 decoding stays in-process, avoids
 temporary PNM files and process spawning, can clamp reduction levels after reading the header, and
 can support full-image IIIF thumbnails that the CLI path currently does not handle reliably.
+
+JPEG2000 first-load viewport benchmark after adding `scripts/bench-jp2-firstload.ps1`. The startup
+viewport scenario models a 2048 x 1024 first OpenSeadragon view using advertised IIIF tile geometry.
+For large-tile master JP2 files, default `512` advertised tiles caused eight cold OpenJPEG fallback
+requests. Advertising `1024` tiles reduced that first viewport to two requests and was faster than
+both `512` and `2048` in this local run:
+
+```text
+run                      image                              startup viewport wall
+tile 512                 mapa2_no_xmp_clean_master.jp2                    6612.7 ms
+tile 512                 mapa2_master.jp2                                10113.1 ms
+tile 1024 experiment     mapa2_no_xmp_clean_master.jp2                    2123.3 ms
+tile 1024 experiment     mapa2_master.jp2                                 2766.8 ms
+tile 2048 experiment     mapa2_no_xmp_clean_master.jp2                    2853.0 ms
+tile 2048 experiment     mapa2_master.jp2                                 3998.5 ms
+auto JP2 master policy   mapa2_no_xmp_clean_master.jp2                    1965.0 ms
+auto JP2 master policy   mapa2_master.jp2                                 2860.6 ms
+```
+
+The resulting policy keeps TIFFs and explicit `--tile-size` settings unchanged, but when the server
+uses the default `512` tile size and detects a large-tile JP2 master that is routed to the OpenJPEG
+fallback, `info.json` advertises `1024 x 1024` tiles. This does not make a single JP2 decode faster;
+it reduces the number of expensive first-viewport decodes.
 
 Small WebP tile-size smoke run after the `pct:` IIIF update
 (`-ImageIds mapa2_no_xmp_clean.tif -Formats webp -OutputSizes 128,256 -Iterations 2 -Parallel 2 -ClearCache`):
