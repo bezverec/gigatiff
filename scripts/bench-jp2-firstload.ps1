@@ -74,6 +74,7 @@ function Invoke-TimedRequest {
             ContentType = Get-HeaderString $response.Headers "Content-Type"
             Cache = Get-HeaderString $response.Headers "x-gigatiff-cache"
             Jp2Backend = Get-HeaderString $response.Headers "x-gigatiff-jp2-backend"
+            OpenJpegThreads = Get-HeaderString $response.Headers "x-gigatiff-openjpeg-threads"
             Jp2TileWidth = Get-HeaderString $response.Headers "x-gigatiff-jp2-tile-width"
             Jp2TileHeight = Get-HeaderString $response.Headers "x-gigatiff-jp2-tile-height"
             Jp2TilesSupported = Get-HeaderString $response.Headers "x-gigatiff-jp2-tiles-supported"
@@ -98,6 +99,7 @@ function Invoke-TimedRequest {
             ContentType = $null
             Cache = $null
             Jp2Backend = $null
+            OpenJpegThreads = $null
             Jp2TileWidth = $null
             Jp2TileHeight = $null
             Jp2TilesSupported = $null
@@ -196,6 +198,7 @@ function Measure-Batch {
                     Status = [int]$response.StatusCode
                     Cache = & $header $response.Headers "x-gigatiff-cache"
                     Jp2Backend = & $header $response.Headers "x-gigatiff-jp2-backend"
+                    OpenJpegThreads = & $header $response.Headers "x-gigatiff-openjpeg-threads"
                     ServerTotalMs = & $doubleHeader $response.Headers "x-gigatiff-total-ms"
                     ServerRenderMs = & $doubleHeader $response.Headers "x-gigatiff-render-ms"
                     ServerEncodeMs = & $doubleHeader $response.Headers "x-gigatiff-encode-ms"
@@ -211,6 +214,7 @@ function Measure-Batch {
                     Status = $null
                     Cache = $null
                     Jp2Backend = $null
+                    OpenJpegThreads = $null
                     ServerTotalMs = $null
                     ServerRenderMs = $null
                     ServerEncodeMs = $null
@@ -244,6 +248,7 @@ function Measure-Batch {
         ContentType = $null
         Cache = (($rows | ForEach-Object Cache | Sort-Object -Unique) -join ",")
         Jp2Backend = (($rows | ForEach-Object Jp2Backend | Sort-Object -Unique) -join ",")
+        OpenJpegThreads = (($rows | ForEach-Object OpenJpegThreads | Sort-Object -Unique) -join ",")
         Jp2TileWidth = $null
         Jp2TileHeight = $null
         Jp2TilesSupported = $null

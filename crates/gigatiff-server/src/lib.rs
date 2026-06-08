@@ -98,7 +98,7 @@ struct ServerCli {
     #[arg(long, env = "GIGATIFF_JP2_BACKEND", value_enum, default_value_t = Jp2BackendPolicy::Auto)]
     jp2_backend: Jp2BackendPolicy,
 
-    /// Worker threads used inside each OpenJPEG FFI decode. Use 1 for single-threaded decoding.
+    /// Maximum worker threads used inside each OpenJPEG FFI decode. Use 1 for single-threaded decoding.
     #[arg(long, env = "GIGATIFF_OPENJPEG_THREADS", default_value_t = 1)]
     openjpeg_threads: usize,
 
@@ -2441,6 +2441,11 @@ async fn iiif_image(
                     HeaderValue::from_static(jp2_backend),
                 );
             }
+            insert_optional_usize_header(
+                response.headers_mut(),
+                "x-gigatiff-openjpeg-threads",
+                rendered.openjpeg_threads,
+            );
             insert_ms_header(
                 response.headers_mut(),
                 "x-gigatiff-total-ms",
@@ -2502,6 +2507,7 @@ struct RenderedResponse {
     canonical_path: String,
     timing: ResponseTiming,
     jp2_backend: Option<&'static str>,
+    openjpeg_threads: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -2557,6 +2563,14 @@ fn render_iiif_image(
     let jp2_backend = select_jp2_backend(state, &info)?;
     let jp2_fallback_cache_backend =
         jp2_backend.and_then(|backend| fallback_cache_backend(state.jp2_backend, backend));
+    let jp2_openjpeg_threads = selected_openjpeg_threads(
+        state.openjpeg_threads,
+        &info,
+        rect,
+        out_width,
+        out_height,
+        jp2_backend,
+    );
 
     let cache_path = if response_cache_enabled(state) {
         let path = response_cache_path(
@@ -2582,6 +2596,7 @@ fn render_iiif_image(
                 canonical_path,
                 timing,
                 jp2_backend: jp2_backend.map(Jp2RenderBackend::label),
+                openjpeg_threads: jp2_openjpeg_threads,
             });
         }
         if let Some(fallback_backend) = jp2_fallback_cache_backend {
@@ -2607,6 +2622,14 @@ fn render_iiif_image(
                     canonical_path,
                     timing,
                     jp2_backend: Some(fallback_backend.label()),
+                    openjpeg_threads: selected_openjpeg_threads(
+                        state.openjpeg_threads,
+                        &info,
+                        rect,
+                        out_width,
+                        out_height,
+                        Some(fallback_backend),
+                    ),
                 });
             }
         }
@@ -2617,7 +2640,7 @@ fn render_iiif_image(
     };
 
     let render_start = Instant::now();
-    let (preview, actual_jp2_backend) = match &info.source {
+    let (preview, actual_jp2_backend, actual_openjpeg_threads) = match &info.source {
         ServerImageSource::Tiff(tiff_info) => (
             render_preview(
                 &image_path,
@@ -2629,6 +2652,7 @@ fn render_iiif_image(
                 None,
                 None,
             )?,
+            None,
             None,
         ),
         #[cfg(any(feature = "jpeg2000-grok", feature = "jpeg2000-openjpeg-ffi"))]
@@ -2711,6 +2735,7 @@ fn render_iiif_image(
         canonical_path,
         timing,
         jp2_backend: actual_jp2_backend.map(Jp2RenderBackend::label),
+        openjpeg_threads: actual_openjpeg_threads,
     })
 }
 
@@ -3391,6 +3416,14 @@ fn insert_ms_header(headers: &mut HeaderMap, name: &'static str, duration: Durat
     let value = format!("{:.2}", duration.as_secs_f64() * 1000.0);
     if let Ok(value) = HeaderValue::from_str(&value) {
         headers.insert(name, value);
+    }
+}
+
+fn insert_optional_usize_header(headers: &mut HeaderMap, name: &'static str, value: Option<usize>) {
+    if let Some(value) = value {
+        if let Ok(value) = HeaderValue::from_str(&value.to_string()) {
+            headers.insert(name, value);
+        }
     }
 }
 
@@ -4166,6 +4199,88 @@ fn is_grok_backend(backend: Jp2RenderBackend) -> bool {
 }
 
 #[cfg(any(feature = "jpeg2000-grok", feature = "jpeg2000-openjpeg-ffi"))]
+fn selected_openjpeg_threads(
+    max_threads: usize,
+    info: &ServerImageInfo,
+    rect: Rect,
+    out_width: u32,
+    out_height: u32,
+    backend: Option<Jp2RenderBackend>,
+) -> Option<usize> {
+    if backend != Some(Jp2RenderBackend::OpenJpegFfi) {
+        return None;
+    }
+    let ServerImageSource::Jpeg2000(jpeg2000) = &info.source else {
+        return None;
+    };
+    Some(openjpeg_threads_for_request(
+        max_threads,
+        jpeg2000,
+        rect,
+        out_width,
+        out_height,
+    ))
+}
+
+#[cfg(not(any(feature = "jpeg2000-grok", feature = "jpeg2000-openjpeg-ffi")))]
+fn selected_openjpeg_threads(
+    _max_threads: usize,
+    _info: &ServerImageInfo,
+    _rect: Rect,
+    _out_width: u32,
+    _out_height: u32,
+    _backend: Option<Jp2RenderBackend>,
+) -> Option<usize> {
+    None
+}
+
+#[cfg(any(feature = "jpeg2000-grok", feature = "jpeg2000-openjpeg-ffi"))]
+fn openjpeg_threads_for_request(
+    max_threads: usize,
+    info: &Jpeg2000Info,
+    rect: Rect,
+    out_width: u32,
+    out_height: u32,
+) -> usize {
+    let max_threads = max_threads.max(1);
+    if max_threads <= 2 {
+        return max_threads;
+    }
+
+    let output_pixels = u64::from(out_width) * u64::from(out_height);
+    if output_pixels <= 256 * 256 {
+        return max_threads.min(2);
+    }
+
+    let tile_width = info.tile_width.unwrap_or_default();
+    let tile_height = info.tile_height.unwrap_or_default();
+    let large_tile = tile_width >= 4096 || tile_height >= 4096;
+    if !large_tile {
+        return max_threads;
+    }
+
+    if rect.width > tile_width || rect.height > tile_height {
+        return max_threads.min(2);
+    }
+
+    if out_width <= 512 && out_height <= 512 {
+        return max_threads.min(2);
+    }
+
+    let half_tile_width = tile_width.saturating_div(2).max(1);
+    let half_tile_height = tile_height.saturating_div(2).max(1);
+    if rect.width <= half_tile_width
+        && rect.height <= half_tile_height
+        && out_width >= 512
+        && out_height >= 512
+    {
+        return max_threads;
+    }
+
+    max_threads.min(2)
+}
+
+#[cfg(any(feature = "jpeg2000-grok", feature = "jpeg2000-openjpeg-ffi"))]
 fn jpeg2000_supports_region_tiles(info: &Jpeg2000Info) -> bool {
     #[cfg(feature = "jpeg2000-openjpeg-ffi")]
     {
@@ -4200,8 +4315,9 @@ fn render_jpeg2000_preview(
     backend: Jp2RenderBackend,
     allow_grok_fallback: bool,
     openjpeg_threads: usize,
-) -> Result<(PreviewBitmap, Option<Jp2RenderBackend>)> {
-    let _ = info;
+) -> Result<(PreviewBitmap, Option<Jp2RenderBackend>, Option<usize>)> {
+    let selected_openjpeg_threads =
+        openjpeg_threads_for_request(openjpeg_threads, info, rect, out_width, out_height);
     let render = match backend {
         Jp2RenderBackend::GrokCli => {
             render_jpeg2000_grok_cli_preview(path, rect, out_width, out_height)
@@ -4211,14 +4327,22 @@ fn render_jpeg2000_preview(
             render_jpeg2000_grok_ffi_preview(path, rect, out_width, out_height)
                 .with_context(|| "rendering JPEG2000 through Grok FFI")
         }
-        Jp2RenderBackend::OpenJpegFfi => {
-            render_jpeg2000_openjpeg_preview(path, rect, out_width, out_height, openjpeg_threads)
-                .with_context(|| "rendering JPEG2000 through OpenJPEG FFI")
-        }
+        Jp2RenderBackend::OpenJpegFfi => render_jpeg2000_openjpeg_preview(
+            path,
+            rect,
+            out_width,
+            out_height,
+            selected_openjpeg_threads,
+        )
+        .with_context(|| "rendering JPEG2000 through OpenJPEG FFI"),
     };
 
     match render {
-        Ok(bitmap) => Ok((bitmap, Some(backend))),
+        Ok(bitmap) => Ok((
+            bitmap,
+            Some(backend),
+            (backend == Jp2RenderBackend::OpenJpegFfi).then_some(selected_openjpeg_threads),
+        )),
         Err(err) if allow_grok_fallback && is_grok_backend(backend) => {
             let Some(fallback) = openjpeg_backend() else {
                 return Err(err);
@@ -4228,10 +4352,10 @@ fn render_jpeg2000_preview(
                 rect,
                 out_width,
                 out_height,
-                openjpeg_threads,
+                selected_openjpeg_threads,
             )
             .with_context(|| format!("{err}; fallback to OpenJPEG FFI also failed"))?;
-            Ok((bitmap, Some(fallback)))
+            Ok((bitmap, Some(fallback), Some(selected_openjpeg_threads)))
         }
         Err(err) => Err(err),
     }
@@ -5732,6 +5856,74 @@ mod tests {
         assert!(jpeg2000_supports_region_tiles(&large_8bit));
         #[cfg(not(feature = "jpeg2000-grok-ffi"))]
         assert!(!jpeg2000_supports_region_tiles(&large_8bit));
+    }
+
+    #[cfg(any(feature = "jpeg2000-grok", feature = "jpeg2000-openjpeg-ffi"))]
+    #[test]
+    fn openjpeg_thread_policy_keeps_large_first_viewport_parallel() {
+        let info = Jpeg2000Info {
+            tile_width: Some(4096),
+            tile_height: Some(4096),
+            precision: Some(8),
+            ..Jpeg2000Info::default()
+        };
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: 1024,
+            height: 1024,
+        };
+        assert_eq!(openjpeg_threads_for_request(4, &info, rect, 1024, 1024), 4);
+    }
+
+    #[cfg(any(feature = "jpeg2000-grok", feature = "jpeg2000-openjpeg-ffi"))]
+    #[test]
+    fn openjpeg_thread_policy_uses_fewer_threads_for_small_or_downsampled_requests() {
+        let info = Jpeg2000Info {
+            tile_width: Some(4096),
+            tile_height: Some(4096),
+            precision: Some(8),
+            ..Jpeg2000Info::default()
+        };
+        let small_rect = Rect {
+            x: 0,
+            y: 0,
+            width: 512,
+            height: 512,
+        };
+        let downsampled_rect = Rect {
+            x: 0,
+            y: 0,
+            width: 4096,
+            height: 4096,
+        };
+
+        assert_eq!(
+            openjpeg_threads_for_request(4, &info, small_rect, 128, 128),
+            2
+        );
+        assert_eq!(
+            openjpeg_threads_for_request(4, &info, downsampled_rect, 512, 512),
+            2
+        );
+    }
+
+    #[cfg(any(feature = "jpeg2000-grok", feature = "jpeg2000-openjpeg-ffi"))]
+    #[test]
+    fn openjpeg_thread_policy_respects_low_configured_limit() {
+        let info = Jpeg2000Info {
+            tile_width: Some(4096),
+            tile_height: Some(4096),
+            precision: Some(8),
+            ..Jpeg2000Info::default()
+        };
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: 1024,
+            height: 1024,
+        };
+        assert_eq!(openjpeg_threads_for_request(1, &info, rect, 1024, 1024), 1);
     }
 
     #[cfg(feature = "jpeg2000-grok")]

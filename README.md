@@ -205,9 +205,9 @@ The server has built-in guard rails intended for production-style Kramerius depl
 - `--max-concurrent-renders` limits global blocking render jobs.
 - `--max-concurrent-renders-per-ip` limits concurrent renders from one client key.
 - `--max-concurrent-renders-per-file` limits concurrent renders for one source image.
-- `--openjpeg-threads` sets the number of worker threads inside each OpenJPEG FFI decode. The CLI
-  default is `1`; Docker/ops examples use `4` because it improved the tested large-tile JP2 first
-  viewport while leaving the setting easy to tune per host.
+- `--openjpeg-threads` sets the maximum number of worker threads inside each OpenJPEG FFI decode.
+  The CLI default is `1`; Docker/ops examples use `4` because it improved the tested large-tile JP2
+  first viewport while leaving the setting easy to tune per host.
 - `--render-timeout-sec` caps the HTTP response wait for decode/render/encode work.
 - `--rate-limit-per-minute` applies a fixed-window per-client request rate limit; `0` disables it.
 - `--enforce-read-only-root` rejects startup when the persistent cache directory is inside the image
@@ -288,6 +288,7 @@ x-gigatiff-encode-ms
 x-gigatiff-cache-store-ms
 x-gigatiff-cache-prune-ms
 x-gigatiff-jp2-backend
+x-gigatiff-openjpeg-threads
 ```
 
 The server targets IIIF Image API 3.0 `level2`. It supports `full`/`square`/`x,y,w,h`/
@@ -326,10 +327,13 @@ files use Grok FFI because it is faster for the 1024 x 1024 tiled user-copy samp
 Grok render fails and OpenJPEG FFI is available, the server retries through OpenJPEG FFI. The actual
 backend used for an IIIF image response is reported in `x-gigatiff-jp2-backend`.
 
-`--openjpeg-threads` controls the thread count used inside each OpenJPEG FFI region decode. Keep this
-balanced with `--max-concurrent-renders-per-ip` and `--max-concurrent-renders-per-file`: for example,
-the Docker examples use two concurrent per-file renders and four OpenJPEG threads, so a single first
-viewport can use up to roughly eight OpenJPEG worker threads on large-tile master JP2 files.
+`--openjpeg-threads` controls the maximum thread count used inside each OpenJPEG FFI region decode.
+The server may choose a lower count for small or heavily downsampled OpenJPEG requests, while keeping
+the configured maximum for large-tile first-viewport requests. Keep this balanced with
+`--max-concurrent-renders-per-ip` and `--max-concurrent-renders-per-file`: for example, the Docker
+examples use two concurrent per-file renders and four OpenJPEG threads, so a single first viewport
+can use up to roughly eight OpenJPEG worker threads on large-tile master JP2 files. The actual count
+used by an IIIF image response is reported in `x-gigatiff-openjpeg-threads`.
 
 ### Docker and Caddy
 
@@ -961,6 +965,30 @@ openjpeg threads  image                              startup viewport wall  serv
 The single-tile timings were not uniformly best at four threads, but the real first-viewport scenario
 was best at `--openjpeg-threads 4` on this machine. The CLI default remains conservative at `1`, while
 Docker/ops examples set `GIGATIFF_OPENJPEG_THREADS=4` as the current large-JP2 starting point.
+
+The next pass changed `--openjpeg-threads` from a fixed per-decode value to a maximum. With
+`--openjpeg-threads 4`, large-tile first-viewport requests still use four OpenJPEG threads, while
+small/downsampled OpenJPEG requests use two. The benchmark script now records the chosen value from
+`x-gigatiff-openjpeg-threads`. The warmed rerun below compares the adaptive policy against the
+previous fixed-4 baseline:
+
+```text
+image                              scenario                         fixed-4 wall  adaptive wall  delta   threads
+mapa2_no_xmp_clean_master.jp2      full_1024                            9415.8 ms     8986.2 ms  -4.6%        2
+mapa2_no_xmp_clean_master.jp2      tile_512_to_128                      1122.8 ms      921.8 ms -17.9%        2
+mapa2_no_xmp_clean_master.jp2      tile_4096_to_512                      977.9 ms      967.0 ms  -1.1%        2
+mapa2_no_xmp_clean_master.jp2      advertised_tile                      1034.2 ms     1046.9 ms  +1.2%        4
+mapa2_no_xmp_clean_master.jp2      startup_viewport_advertised_tile     1153.4 ms     1147.8 ms  -0.5%        4
+mapa2_master.jp2                   full_1024                           28194.9 ms    27942.0 ms  -0.9%        2
+mapa2_master.jp2                   tile_512_to_128                      1438.8 ms     1558.7 ms  +8.3%        2
+mapa2_master.jp2                   tile_4096_to_512                     1432.9 ms     1232.7 ms -14.0%        2
+mapa2_master.jp2                   advertised_tile                      1972.6 ms     1470.3 ms -25.5%        4
+mapa2_master.jp2                   startup_viewport_advertised_tile     1801.4 ms     1644.0 ms  -8.7%        4
+```
+
+The result is deliberately modest: it preserves the first-viewport path, improves several expensive
+single-request cases, and shows one small-tile regression on the 16-bit master sample. The policy is
+therefore treated as a measured heuristic rather than a universal OpenJPEG rule.
 
 OpenJPEG FFI component-to-RGBA conversion now uses a parallel row path only when the OpenJPEG decode
 itself is single-threaded. The first attempt also parallelized conversion while OpenJPEG was using
