@@ -154,6 +154,8 @@ enum ServerImageSource {
 struct Jpeg2000Info {
     components: Option<u32>,
     precision: Option<u32>,
+    tile_width: Option<u32>,
+    tile_height: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -494,7 +496,7 @@ async fn iiif_info(state: Arc<AppState>, headers: HeaderMap, id: String) -> Resp
     };
 
     let service_id = format!("{}/iiif/3/{}", request_origin(&headers), encode_id(&id));
-    let body = json!({
+    let mut body = json!({
         "@context": "http://iiif.io/api/image/3/context.json",
         "id": service_id,
         "type": "ImageService3",
@@ -516,13 +518,16 @@ async fn iiif_info(state: Arc<AppState>, headers: HeaderMap, id: String) -> Resp
             "sizeUpscaling"
         ],
         "extraQualities": ["color", "gray", "bitonal"],
-        "sizes": preferred_sizes(info.width, info.height, state.max_output_pixels),
-        "tiles": [{
+        "sizes": preferred_sizes(info.width, info.height, state.max_output_pixels)
+    });
+
+    if should_advertise_tiles(&info) {
+        body["tiles"] = json!([{
             "width": state.tile_size,
             "height": state.tile_size,
             "scaleFactors": scale_factors(info.width, info.height)
-        }]
-    });
+        }]);
+    }
 
     let mut response = Json(body).into_response();
     response.headers_mut().insert(
@@ -780,7 +785,7 @@ fn response_cache_path(
         .unwrap_or_else(|_| image_path.to_path_buf());
 
     let mut hash = Fnv1a64::new();
-    hash.write_bytes(b"gigatiff-server-response-v1");
+    hash.write_bytes(b"gigatiff-server-response-v3");
     hash.write_bytes(canonical.to_string_lossy().as_bytes());
     hash.write_u64(metadata.len());
     hash.write_u64(modified.as_secs());
@@ -797,6 +802,8 @@ fn response_cache_path(
         ServerImageSource::Jpeg2000(jpeg2000_info) => {
             hash.write_u64(jpeg2000_info.components.unwrap_or_default() as u64);
             hash.write_u64(jpeg2000_info.precision.unwrap_or_default() as u64);
+            hash.write_u64(jpeg2000_info.tile_width.unwrap_or_default() as u64);
+            hash.write_u64(jpeg2000_info.tile_height.unwrap_or_default() as u64);
         }
     }
     hash.write_u64(out_width as u64);
@@ -1817,6 +1824,8 @@ fn parse_grok_dump_info(text: &str) -> Result<ParsedGrokInfo> {
         jpeg2000: Jpeg2000Info {
             components: field_value(&fields, &["numcomps", "components", "num_components"]),
             precision: field_value(&fields, &["prec", "precision", "bpp"]),
+            tile_width: field_value(&fields, &["tdx", "tile_width"]),
+            tile_height: field_value(&fields, &["tdy", "tile_height"]),
         },
     })
 }
@@ -2172,6 +2181,17 @@ fn is_jpeg2000_path(path: &Path) -> bool {
 
 fn is_supported_image_path(path: &Path) -> bool {
     is_tiff_path(path) || is_jpeg2000_path(path)
+}
+
+fn should_advertise_tiles(info: &ServerImageInfo) -> bool {
+    match &info.source {
+        ServerImageSource::Tiff(_) => true,
+        #[cfg(feature = "jpeg2000-grok")]
+        ServerImageSource::Jpeg2000(jpeg2000) => {
+            jpeg2000.tile_width.unwrap_or_default() < 4096
+                && jpeg2000.tile_height.unwrap_or_default() < 4096
+        }
+    }
 }
 
 fn error_response(status: StatusCode, err: anyhow::Error) -> Response {
@@ -2701,6 +2721,7 @@ mod tests {
             image {
               x0=0, y0=0, x1=4096, y1=2048
               numcomps=3
+              tdx=4096, tdy=4096
             }
             comp 0: prec=12
         "#;
@@ -2711,6 +2732,34 @@ mod tests {
         assert_eq!(info.height, 2048);
         assert_eq!(info.jpeg2000.components, Some(3));
         assert_eq!(info.jpeg2000.precision, Some(12));
+        assert_eq!(info.jpeg2000.tile_width, Some(4096));
+        assert_eq!(info.jpeg2000.tile_height, Some(4096));
+    }
+
+    #[cfg(feature = "jpeg2000-grok")]
+    #[test]
+    fn large_jpeg2000_tiles_disable_iiif_tile_advertisement() {
+        let info = ServerImageInfo {
+            width: 4096,
+            height: 2048,
+            source: ServerImageSource::Jpeg2000(Jpeg2000Info {
+                tile_width: Some(4096),
+                tile_height: Some(4096),
+                ..Jpeg2000Info::default()
+            }),
+        };
+        assert!(!should_advertise_tiles(&info));
+
+        let info = ServerImageInfo {
+            width: 4096,
+            height: 2048,
+            source: ServerImageSource::Jpeg2000(Jpeg2000Info {
+                tile_width: Some(1024),
+                tile_height: Some(1024),
+                ..Jpeg2000Info::default()
+            }),
+        };
+        assert!(should_advertise_tiles(&info));
     }
 
     #[cfg(feature = "jpeg2000-grok")]
