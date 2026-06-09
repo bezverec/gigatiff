@@ -3809,6 +3809,18 @@ fn validate_identifier_text(id: &str) -> Result<()> {
 
 fn parse_iiif_image_request(tail: &str) -> Result<IiifImageRequest> {
     validate_iiif_tail(tail)?;
+    if let Some(id) = tail.strip_suffix("/full/") {
+        validate_identifier_text(id)?;
+        return Ok(IiifImageRequest {
+            id: id.to_string(),
+            region: "full".to_string(),
+            size: ",128".to_string(),
+            rotation: "0".to_string(),
+            quality: "default".to_string(),
+            format: ImageFormat::Jpeg,
+        });
+    }
+
     let mut parts = tail.rsplitn(5, '/');
     let quality_format = parts
         .next()
@@ -5416,6 +5428,19 @@ mod tests {
         assert_eq!(request.size, "256,");
         assert_eq!(request.rotation, "0");
         assert_eq!(request.quality, "default");
+    }
+
+    #[test]
+    fn parses_kramerius_truncated_thumbnail_request() {
+        let request =
+            parse_iiif_image_request("2026/06/09/vkol-00b4jr/uc_vkol-00b4jr_0002.jp2/full/")
+                .unwrap();
+        assert_eq!(request.id, "2026/06/09/vkol-00b4jr/uc_vkol-00b4jr_0002.jp2");
+        assert_eq!(request.region, "full");
+        assert_eq!(request.size, ",128");
+        assert_eq!(request.rotation, "0");
+        assert_eq!(request.quality, "default");
+        assert!(matches!(request.format, ImageFormat::Jpeg));
     }
 
     #[test]
