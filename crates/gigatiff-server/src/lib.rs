@@ -2810,7 +2810,7 @@ fn render_iiif_image(
         );
     }
 
-    let jp2_backend = select_jp2_backend(state, &info)?;
+    let jp2_backend = select_jp2_backend(state, &info, rect, out_width, out_height)?;
     let jp2_fallback_cache_backend =
         jp2_backend.and_then(|backend| fallback_cache_backend(state.jp2_backend, backend));
     let jp2_openjpeg_threads = selected_openjpeg_threads(
@@ -4433,6 +4433,9 @@ fn enrich_jpeg2000_info_from_openjpeg(_path: &Path, _info: &mut Jpeg2000Info) {}
 fn select_jp2_backend(
     state: &AppState,
     info: &ServerImageInfo,
+    rect: Rect,
+    out_width: u32,
+    out_height: u32,
 ) -> Result<Option<Jp2RenderBackend>> {
     let ServerImageSource::Jpeg2000(jpeg2000) = &info.source else {
         return Ok(None);
@@ -4440,7 +4443,7 @@ fn select_jp2_backend(
 
     match state.jp2_backend {
         Jp2BackendPolicy::Auto => {
-            if should_use_openjpeg_fallback(jpeg2000) {
+            if should_use_openjpeg_for_request(jpeg2000, rect, out_width, out_height) {
                 return openjpeg_backend()
                     .ok_or_else(|| {
                         anyhow!("JPEG2000 auto selected OpenJPEG, but it is not enabled")
@@ -4467,6 +4470,9 @@ fn select_jp2_backend(
 fn select_jp2_backend(
     _state: &AppState,
     _info: &ServerImageInfo,
+    _rect: Rect,
+    _out_width: u32,
+    _out_height: u32,
 ) -> Result<Option<Jp2RenderBackend>> {
     Ok(None)
 }
@@ -4825,6 +4831,36 @@ fn render_jpeg2000_grok_ffi_preview(
 #[cfg(any(feature = "jpeg2000-grok", feature = "jpeg2000-openjpeg-ffi"))]
 fn should_use_openjpeg_fallback(info: &Jpeg2000Info) -> bool {
     info.tile_width.unwrap_or_default() >= 4096 || info.tile_height.unwrap_or_default() >= 4096
+}
+
+#[cfg(any(feature = "jpeg2000-grok", feature = "jpeg2000-openjpeg-ffi"))]
+fn should_use_openjpeg_for_request(
+    info: &Jpeg2000Info,
+    rect: Rect,
+    out_width: u32,
+    out_height: u32,
+) -> bool {
+    if should_use_openjpeg_fallback(info) {
+        return true;
+    }
+
+    // Grok FFI is fastest for reduced JP2 overviews, but arbitrary full-resolution
+    // sub-tile regions can produce corrupt component buffers. Keep OpenJPEG on the
+    // exact/detail zoom path where correctness matters most.
+    jpeg2000_request_reduce_factor(rect, out_width, out_height) == 0
+}
+
+#[cfg(any(feature = "jpeg2000-grok", feature = "jpeg2000-openjpeg-ffi"))]
+fn jpeg2000_request_reduce_factor(rect: Rect, out_width: u32, out_height: u32) -> u32 {
+    let width_scale = rect.width.max(1) / out_width.max(1);
+    let height_scale = rect.height.max(1) / out_height.max(1);
+    let mut scale = width_scale.min(height_scale);
+    let mut reduce = 0;
+    while scale >= 2 && reduce < 8 {
+        reduce += 1;
+        scale /= 2;
+    }
+    reduce
 }
 
 #[cfg(feature = "jpeg2000-openjpeg-ffi")]
@@ -6225,6 +6261,46 @@ mod tests {
         assert!(jpeg2000_supports_region_tiles(&large_8bit));
         #[cfg(not(feature = "jpeg2000-grok-ffi"))]
         assert!(!jpeg2000_supports_region_tiles(&large_8bit));
+    }
+
+    #[cfg(any(feature = "jpeg2000-grok", feature = "jpeg2000-openjpeg-ffi"))]
+    #[test]
+    fn jpeg2000_auto_keeps_grok_for_reduced_tiles() {
+        let info = Jpeg2000Info {
+            tile_width: Some(1024),
+            tile_height: Some(1024),
+            precision: Some(8),
+            ..Jpeg2000Info::default()
+        };
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: 1024,
+            height: 1024,
+        };
+
+        assert_eq!(jpeg2000_request_reduce_factor(rect, 512, 512), 1);
+        assert!(!should_use_openjpeg_for_request(&info, rect, 512, 512));
+    }
+
+    #[cfg(any(feature = "jpeg2000-grok", feature = "jpeg2000-openjpeg-ffi"))]
+    #[test]
+    fn jpeg2000_auto_uses_openjpeg_for_full_resolution_tiles() {
+        let info = Jpeg2000Info {
+            tile_width: Some(1024),
+            tile_height: Some(1024),
+            precision: Some(8),
+            ..Jpeg2000Info::default()
+        };
+        let rect = Rect {
+            x: 1536,
+            y: 3072,
+            width: 512,
+            height: 512,
+        };
+
+        assert_eq!(jpeg2000_request_reduce_factor(rect, 512, 512), 0);
+        assert!(should_use_openjpeg_for_request(&info, rect, 512, 512));
     }
 
     #[cfg(any(feature = "jpeg2000-grok", feature = "jpeg2000-openjpeg-ffi"))]
