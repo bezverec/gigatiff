@@ -408,14 +408,14 @@ replace tags with image digests in your deployment environment.
 Example image build with SBOM/provenance:
 
 ```powershell
-.\scripts\build-server-image.ps1 -Image ghcr.io/bezverec/gigatiff-server:0.2.0
+.\scripts\build-server-image.ps1 -Image ghcr.io/bezverec/gigatiff-server:0.3.0
 ```
 
 Multi-arch publication can use the same helper when the builder supports the requested platforms:
 
 ```powershell
 .\scripts\build-server-image.ps1 `
-  -Image ghcr.io/bezverec/gigatiff-server:0.2.0 `
+  -Image ghcr.io/bezverec/gigatiff-server:0.3.0 `
   -Platform linux/amd64,linux/arm64 `
   -Push
 ```

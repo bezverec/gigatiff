@@ -7,6 +7,7 @@ FROM ${RUST_IMAGE} AS build
 ARG GROK_VERSION=v20.3.3
 ARG GIGATIFF_BUILD_GROK=1
 ARG GIGATIFF_SERVER_FEATURES=jpeg2000-grok-ffi
+ARG GIGATIFF_BUILD_JOBS=2
 
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     ca-certificates \
@@ -30,7 +31,7 @@ RUN if [ "${GIGATIFF_BUILD_GROK}" = "1" ]; then \
       -DBUILD_TESTING=OFF \
       -DGRK_BUILD_CODEC=ON \
       -DGRK_BUILD_DOC=OFF \
-    && cmake --build /tmp/grok-build --parallel \
+    && cmake --build /tmp/grok-build --parallel "${GIGATIFF_BUILD_JOBS}" \
     && cmake --install /tmp/grok-build \
     && ldconfig \
     && rm -rf /tmp/grok /tmp/grok-build; \
@@ -39,9 +40,9 @@ RUN if [ "${GIGATIFF_BUILD_GROK}" = "1" ]; then \
 WORKDIR /app
 COPY . .
 RUN if [ -n "${GIGATIFF_SERVER_FEATURES}" ]; then \
-      cargo build --release --locked -p gigatiff-server --bin gigatiff-server --features "${GIGATIFF_SERVER_FEATURES}"; \
+      cargo build --release --locked --jobs "${GIGATIFF_BUILD_JOBS}" -p gigatiff-server --bin gigatiff-server --features "${GIGATIFF_SERVER_FEATURES}"; \
     else \
-      cargo build --release --locked -p gigatiff-server --bin gigatiff-server; \
+      cargo build --release --locked --jobs "${GIGATIFF_BUILD_JOBS}" -p gigatiff-server --bin gigatiff-server; \
     fi
 
 FROM ${DEBIAN_RUNTIME_IMAGE}
