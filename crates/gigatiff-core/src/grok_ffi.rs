@@ -36,19 +36,24 @@ pub fn render_region(
     ensure_initialized();
 
     let decode_start = Instant::now();
-    let mut stream = unsafe { std::mem::zeroed::<grk::grk_stream_params>() };
+    let mut stream = zeroed_stream_params();
     set_stream_path(&mut stream, path)?;
     stream.is_read_stream = true;
 
-    let mut params = unsafe { std::mem::zeroed::<grk::grk_decompress_parameters>() };
+    let mut params = zeroed_decompress_parameters();
     params.core.tile_cache_strategy = grk::GRK_TILE_CACHE_NONE;
     apply_rgb_upsample_to_params(&mut params);
 
+    // SAFETY: `stream` and `params` are Grok C structs initialized according
+    // to the Grok CLI defaults: zeroed storage followed by explicit fields.
+    // Both pointers remain valid for the duration of this call.
     let codec = CodecGuard::new(unsafe { grk::grk_decompress_init(&mut stream, &mut params) })
         .with_context(|| format!("initializing Grok decompressor for {}", path.display()))?;
 
-    let mut header = unsafe { std::mem::zeroed::<grk::grk_header_info>() };
+    let mut header = zeroed_header_info();
     apply_rgb_upsample_to_header(&mut header);
+    // SAFETY: `codec` is a non-null Grok decompressor owned by `CodecGuard`,
+    // and `header` points to writable storage for Grok to populate.
     if !unsafe { grk::grk_decompress_read_header(codec.as_ptr(), &mut header) } {
         bail!("reading JPEG2000 header through Grok FFI failed");
     }
@@ -59,17 +64,25 @@ pub fn render_region(
     params.dw_x1 = x1 as f64;
     params.dw_y1 = y1 as f64;
     params.dw_reduced = false;
+    // SAFETY: `codec` is still alive and `params` is the same parameter
+    // object family used to create it, with a validated decode window.
     if !unsafe { grk::grk_decompress_update(&mut params, codec.as_ptr()) } {
         bail!("updating Grok FFI decode window failed");
     }
+    // SAFETY: Grok owns all internal decode state behind `codec`; the optional
+    // plugin callback pointer is null because GigaTIFF does not install one.
     if !unsafe { grk::grk_decompress(codec.as_ptr(), ptr::null_mut()) } {
         bail!("Grok FFI decompression failed");
     }
 
+    // SAFETY: Grok returns a borrowed image pointer tied to the decompressor.
+    // `CodecGuard` is kept alive until after RGBA conversion.
     let image = unsafe { grk::grk_decompress_get_image(codec.as_ptr()) };
     let decode = decode_start.elapsed();
 
     let convert_start = Instant::now();
+    // SAFETY: `image` is checked for null and component validity inside
+    // `image_to_rgba`; the borrowed image does not outlive `codec`.
     let (width, height, color_space, rgba) = unsafe { image_to_rgba(image)? };
     let convert = convert_start.elapsed();
 
@@ -85,8 +98,28 @@ pub fn render_region(
 
 fn ensure_initialized() {
     INIT.call_once(|| unsafe {
+        // SAFETY: Grok global initialization is documented as process-global.
+        // `Once` guarantees this call runs at most once.
         grk::grk_initialize(ptr::null::<c_char>(), 1, ptr::null_mut());
     });
+}
+
+fn zeroed_stream_params() -> grk::grk_stream_params {
+    // SAFETY: Grok's C API expects `grk_stream_params` to be zero-initialized
+    // before callers fill the file path and stream direction fields.
+    unsafe { std::mem::zeroed() }
+}
+
+fn zeroed_decompress_parameters() -> grk::grk_decompress_parameters {
+    // SAFETY: This mirrors Grok's CLI/default initialization pattern for
+    // plain-old-data decoder parameters; fields are then set explicitly.
+    unsafe { std::mem::zeroed() }
+}
+
+fn zeroed_header_info() -> grk::grk_header_info {
+    // SAFETY: Grok writes the whole `grk_header_info` structure in
+    // `grk_decompress_read_header`; selected flags are set before the call.
+    unsafe { std::mem::zeroed() }
 }
 
 fn apply_rgb_upsample_to_params(params: &mut grk::grk_decompress_parameters) {
@@ -150,11 +183,15 @@ unsafe fn image_to_rgba(image: *mut grk::grk_image) -> Result<(u32, u32, u32, Ve
     if image.is_null() {
         bail!("Grok returned a null image");
     }
+    // SAFETY: Null was rejected above; the pointer is borrowed from Grok and
+    // remains valid while the owning decompressor is alive.
     let image_ref = unsafe { &*image };
     let components = image_ref.numcomps as usize;
     if components == 0 || image_ref.comps.is_null() {
         bail!("Grok returned an image without components");
     }
+    // SAFETY: Grok reports `numcomps` elements at `comps`; null and zero
+    // component cases were rejected before constructing the slice.
     let comps = unsafe { std::slice::from_raw_parts(image_ref.comps, components) };
     let width = comps[0].w;
     let height = comps[0].h;
@@ -182,6 +219,8 @@ unsafe fn image_to_rgba(image: *mut grk::grk_image) -> Result<(u32, u32, u32, Ve
         let gray = &views.components[0];
         for y in 0..height as usize {
             for x in 0..width as usize {
+                // SAFETY: Loop bounds are derived from the validated component
+                // dimensions stored in `ComponentView`.
                 let gray = unsafe { gray.sample_to_u8_unchecked(x, y) };
                 rgba.push(gray);
                 rgba.push(gray);
@@ -195,6 +234,8 @@ unsafe fn image_to_rgba(image: *mut grk::grk_image) -> Result<(u32, u32, u32, Ve
         let blue = &views.components[2];
         for y in 0..height as usize {
             for x in 0..width as usize {
+                // SAFETY: Loop bounds are derived from the validated component
+                // dimensions stored in `ComponentView`.
                 rgba.push(unsafe { red.sample_to_u8_unchecked(x, y) });
                 rgba.push(unsafe { green.sample_to_u8_unchecked(x, y) });
                 rgba.push(unsafe { blue.sample_to_u8_unchecked(x, y) });
@@ -297,6 +338,8 @@ impl ComponentView {
         debug_assert!(x < self.width);
         debug_assert!(y < self.height);
         let index = y * self.stride + x;
+        // SAFETY: `ComponentView::new` validated a non-null data pointer,
+        // compatible data type, stride >= width, and maximum index range.
         let sample = unsafe { self.reader.read(self.data, index) };
         let value = if self.signed {
             sample.saturating_add(self.signed_bias).max(0) as u64
@@ -330,6 +373,8 @@ impl SampleReader {
 
     unsafe fn read(self, data: *const std::ffi::c_void, index: usize) -> i64 {
         match self {
+            // SAFETY: The caller selects the reader from Grok's component
+            // data_type and validates that `index` is in-bounds for the buffer.
             Self::I8 => unsafe { *(data as *const i8).add(index) as i64 },
             Self::I16 => unsafe { *(data as *const i16).add(index) as i64 },
             Self::I32 => unsafe { *(data as *const i32).add(index) as i64 },
@@ -354,7 +399,70 @@ impl CodecGuard {
 impl Drop for CodecGuard {
     fn drop(&mut self) {
         unsafe {
+            // SAFETY: `CodecGuard` owns exactly one non-null Grok object
+            // returned by `grk_decompress_init`.
             grk::grk_object_unref(self.ptr);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reduce_factor_is_clamped_to_available_resolutions() {
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: 4096,
+            height: 4096,
+        };
+
+        assert_eq!(reduce_factor(rect, 4096, 4096, 6).unwrap(), 0);
+        assert_eq!(reduce_factor(rect, 512, 512, 6).unwrap(), 3);
+        assert_eq!(reduce_factor(rect, 1, 1, 3).unwrap(), 2);
+        assert!(reduce_factor(rect, 512, 512, 0).is_err());
+    }
+
+    #[test]
+    fn decode_window_rejects_non_intersecting_rectangles() {
+        let mut image = zeroed_image();
+        image.x0 = 10;
+        image.y0 = 20;
+        image.x1 = 110;
+        image.y1 = 220;
+
+        assert_eq!(
+            decode_window(
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 20,
+                    height: 40,
+                },
+                &image
+            )
+            .unwrap(),
+            (10, 20, 20, 40)
+        );
+        assert!(
+            decode_window(
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 5,
+                    height: 5,
+                },
+                &image
+            )
+            .is_err()
+        );
+    }
+
+    fn zeroed_image() -> grk::grk_image {
+        // SAFETY: Tests only fill and read the image extent fields used by
+        // `decode_window`; no Grok API observes this synthetic value.
+        unsafe { std::mem::zeroed() }
     }
 }

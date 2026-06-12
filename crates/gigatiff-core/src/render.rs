@@ -264,6 +264,8 @@ impl LibtiffFile {
         let path = CString::new(path.to_string_lossy().as_bytes())
             .context("TIFF path contains an embedded NUL byte")?;
         let mode = CString::new("r")?;
+        // SAFETY: `path` and `mode` are valid NUL-terminated C strings and
+        // live for the duration of the call. libtiff returns null on failure.
         let handle = unsafe { TIFFOpen(path.as_ptr(), mode.as_ptr()) };
         if handle.is_null() {
             bail!("libtiff could not open the file");
@@ -275,6 +277,8 @@ impl LibtiffFile {
 impl Drop for LibtiffFile {
     fn drop(&mut self) {
         unsafe {
+            // SAFETY: `LibtiffFile` owns a non-null handle returned by
+            // `TIFFOpen`, and `Drop` runs exactly once for the owner.
             TIFFClose(self.handle);
         }
     }
@@ -297,6 +301,7 @@ fn render_libtiff_scanline_preview(
     }
 
     let tif = LibtiffFile::open(path)?;
+    // SAFETY: `tif.handle` is a live libtiff handle owned by `LibtiffFile`.
     if unsafe { TIFFIsTiled(tif.handle) } != 0 {
         bail!("libtiff scanline backend does not handle tiled TIFF yet");
     }
@@ -311,6 +316,8 @@ fn render_libtiff_scanline_preview(
     let bytes_per_pixel = samples * bytes_per_sample;
     let color_transform = ColorTransform::new(info.color_type, info.icc_profile.as_deref())?;
     let expected_min_scanline = info.width as usize * bytes_per_pixel;
+    // SAFETY: `tif.handle` is a live libtiff handle; the function only reads
+    // metadata and returns the scanline buffer size.
     let scanline_size = unsafe { TIFFScanlineSize64(tif.handle) } as usize;
     if scanline_size < expected_min_scanline {
         bail!(
@@ -353,6 +360,9 @@ fn render_libtiff_scanline_preview(
         } else {
             stats.scanline_cache_misses += u32::from(scanline_cache.is_some());
             let read_start = Instant::now();
+            // SAFETY: `row` is allocated to at least `TIFFScanlineSize64`
+            // bytes, `src_y` comes from the clamped render rectangle, and
+            // sample 0 is valid for contiguous planar config checked above.
             let ok = unsafe {
                 TIFFReadScanline(
                     tif.handle,
@@ -778,5 +788,48 @@ pub fn fit_size(width: u32, height: u32, max_output: u32) -> (u32, u32) {
             ((width as u64 * max_output as u64) / height as u64) as u32,
         );
         (out_w, max_output)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sampling_plan_maps_output_pixels_into_source_rect() {
+        let plan = SamplingPlan::new(
+            Rect {
+                x: 10,
+                y: 20,
+                width: 8,
+                height: 4,
+            },
+            4,
+            2,
+            3,
+        );
+
+        assert_eq!(plan.src_x, vec![10, 12, 14, 16]);
+        assert_eq!(plan.src_y, vec![20, 22]);
+        assert_eq!(plan.src_x_byte_offsets, vec![0, 6, 12, 18]);
+    }
+
+    #[test]
+    fn sampling_plan_keeps_single_pixel_outputs_at_rect_origin() {
+        let plan = SamplingPlan::new(
+            Rect {
+                x: 7,
+                y: 11,
+                width: 100,
+                height: 50,
+            },
+            1,
+            1,
+            4,
+        );
+
+        assert_eq!(plan.src_x, vec![7]);
+        assert_eq!(plan.src_y, vec![11]);
+        assert_eq!(plan.src_x_byte_offsets, vec![0]);
     }
 }

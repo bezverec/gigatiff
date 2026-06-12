@@ -54,7 +54,11 @@ pub fn render_region(
     let decoder = Decoder::open(path, threads.max(1), reduce)?;
     set_decode_area(decoder.codec, decoder.image, rect)?;
 
+    // SAFETY: `decoder` owns live OpenJPEG codec, stream, and image handles.
+    // OpenJPEG reports decode/end failures through integer return codes.
     let decoded = unsafe { opj::opj_decode(decoder.codec, decoder.stream, decoder.image) } != 0;
+    // SAFETY: Same handles as above; `opj_end_decompress` finalizes stream
+    // state and does not transfer ownership.
     let ended = unsafe { opj::opj_end_decompress(decoder.codec, decoder.stream) } != 0;
     if !decoded || !ended {
         bail!("OpenJPEG FFI decompression failed");
@@ -62,6 +66,8 @@ pub fn render_region(
     let decode = decode_start.elapsed();
 
     let convert_start = Instant::now();
+    // SAFETY: `decoder.image` is owned by `decoder` and remains valid until
+    // after conversion. `image_to_rgba` validates component pointers/sizes.
     let (width, height, rgba) = unsafe { image_to_rgba(decoder.image, threads.max(1))? };
     let convert = convert_start.elapsed();
 
@@ -82,62 +88,60 @@ struct Decoder {
 
 impl Decoder {
     fn open(path: &Path, threads: i32, reduce: u32) -> Result<Self> {
-        let mut params = unsafe {
-            let mut p = std::mem::MaybeUninit::<opj::opj_dparameters_t>::zeroed();
-            opj::opj_set_default_decoder_parameters(p.as_mut_ptr());
-            p.assume_init()
-        };
+        let mut params = default_decoder_parameters();
         params.cp_reduce = reduce;
         params.decod_format = if is_raw_codestream(path) { 0 } else { 1 };
 
-        let codec = unsafe {
+        // SAFETY: OpenJPEG returns either a valid codec pointer for the chosen
+        // codestream format or null on allocation/setup failure.
+        let codec = RawCodec::new(unsafe {
             opj::opj_create_decompress(if is_raw_codestream(path) {
                 opj::CODEC_FORMAT::OPJ_CODEC_J2K
             } else {
                 opj::CODEC_FORMAT::OPJ_CODEC_JP2
             })
-        };
-        if codec.is_null() {
-            bail!("opj_create_decompress failed");
-        }
+        })
+        .ok_or_else(|| anyhow!("opj_create_decompress failed"))?;
 
-        let setup_ok = unsafe { opj::opj_setup_decoder(codec, &mut params) } != 0;
+        // SAFETY: `codec` is a live OpenJPEG decoder and `params` was
+        // initialized by `opj_set_default_decoder_parameters`.
+        let setup_ok = unsafe { opj::opj_setup_decoder(codec.as_ptr(), &mut params) } != 0;
         if !setup_ok {
-            unsafe { opj::opj_destroy_codec(codec) };
             bail!("opj_setup_decoder failed");
         }
 
         if threads > 1 {
-            let ok = unsafe { opj::opj_codec_set_threads(codec, threads) } != 0;
+            // SAFETY: `codec` remains live; OpenJPEG validates the thread
+            // count and reports failure through the return code.
+            let ok = unsafe { opj::opj_codec_set_threads(codec.as_ptr(), threads) } != 0;
             if !ok {
-                unsafe { opj::opj_destroy_codec(codec) };
                 bail!("opj_codec_set_threads failed");
             }
         }
 
         let c_path = path_to_cstring(path)?;
-        let stream = unsafe {
+        // SAFETY: `c_path` is a valid NUL-terminated path and lives for the
+        // duration of the call. OpenJPEG copies/opens it immediately.
+        let stream = RawStream::new(unsafe {
             opj::opj_stream_create_default_file_stream(c_path.as_ptr(), opj::OPJ_TRUE as i32)
-        };
-        if stream.is_null() {
-            unsafe { opj::opj_destroy_codec(codec) };
-            bail!("opj_stream_create_default_file_stream failed");
-        }
+        })
+        .ok_or_else(|| anyhow!("opj_stream_create_default_file_stream failed"))?;
 
         let mut image: *mut opj::opj_image_t = std::ptr::null_mut();
-        let ok = unsafe { opj::opj_read_header(stream, codec, &mut image) } != 0;
-        if !ok || image.is_null() {
-            unsafe {
-                opj::opj_stream_destroy(stream);
-                opj::opj_destroy_codec(codec);
-            }
+        // SAFETY: `stream` and `codec` are live OpenJPEG objects and `image`
+        // points to writable storage for OpenJPEG to return image metadata.
+        let ok = unsafe { opj::opj_read_header(stream.as_ptr(), codec.as_ptr(), &mut image) } != 0;
+        let Some(image) = RawImage::new(image) else {
+            bail!("opj_read_header failed");
+        };
+        if !ok {
             bail!("opj_read_header failed");
         }
 
         Ok(Self {
-            codec,
-            stream,
-            image,
+            codec: codec.into_raw(),
+            stream: stream.into_raw(),
+            image: image.into_raw(),
         })
     }
 }
@@ -145,6 +149,8 @@ impl Decoder {
 impl Drop for Decoder {
     fn drop(&mut self) {
         unsafe {
+            // SAFETY: `Decoder` owns these OpenJPEG objects after successful
+            // construction. Null checks make partial/manual construction safe.
             if !self.image.is_null() {
                 opj::opj_image_destroy(self.image);
             }
@@ -154,6 +160,102 @@ impl Drop for Decoder {
             if !self.codec.is_null() {
                 opj::opj_destroy_codec(self.codec);
             }
+        }
+    }
+}
+
+fn default_decoder_parameters() -> opj::opj_dparameters_t {
+    let mut params = std::mem::MaybeUninit::<opj::opj_dparameters_t>::zeroed();
+    // SAFETY: OpenJPEG's documented initialization path writes default decoder
+    // parameters into caller-provided storage.
+    unsafe {
+        opj::opj_set_default_decoder_parameters(params.as_mut_ptr());
+        params.assume_init()
+    }
+}
+
+struct RawCodec {
+    ptr: *mut opj::opj_codec_t,
+}
+
+impl RawCodec {
+    fn new(ptr: *mut opj::opj_codec_t) -> Option<Self> {
+        (!ptr.is_null()).then_some(Self { ptr })
+    }
+
+    fn as_ptr(&self) -> *mut opj::opj_codec_t {
+        self.ptr
+    }
+
+    fn into_raw(self) -> *mut opj::opj_codec_t {
+        let ptr = self.ptr;
+        std::mem::forget(self);
+        ptr
+    }
+}
+
+impl Drop for RawCodec {
+    fn drop(&mut self) {
+        unsafe {
+            // SAFETY: `RawCodec` owns a non-null pointer returned by
+            // `opj_create_decompress` until `into_raw` transfers ownership.
+            opj::opj_destroy_codec(self.ptr);
+        }
+    }
+}
+
+struct RawStream {
+    ptr: *mut opj::opj_stream_t,
+}
+
+impl RawStream {
+    fn new(ptr: *mut opj::opj_stream_t) -> Option<Self> {
+        (!ptr.is_null()).then_some(Self { ptr })
+    }
+
+    fn as_ptr(&self) -> *mut opj::opj_stream_t {
+        self.ptr
+    }
+
+    fn into_raw(self) -> *mut opj::opj_stream_t {
+        let ptr = self.ptr;
+        std::mem::forget(self);
+        ptr
+    }
+}
+
+impl Drop for RawStream {
+    fn drop(&mut self) {
+        unsafe {
+            // SAFETY: `RawStream` owns a non-null pointer returned by
+            // `opj_stream_create_default_file_stream` until ownership transfer.
+            opj::opj_stream_destroy(self.ptr);
+        }
+    }
+}
+
+struct RawImage {
+    ptr: *mut opj::opj_image_t,
+}
+
+impl RawImage {
+    fn new(ptr: *mut opj::opj_image_t) -> Option<Self> {
+        (!ptr.is_null()).then_some(Self { ptr })
+    }
+
+    fn into_raw(self) -> *mut opj::opj_image_t {
+        let ptr = self.ptr;
+        std::mem::forget(self);
+        ptr
+    }
+}
+
+impl Drop for RawImage {
+    fn drop(&mut self) {
+        unsafe {
+            // SAFETY: `RawImage` owns a non-null pointer returned by
+            // `opj_read_header` until ownership is transferred to `Decoder`.
+            opj::opj_image_destroy(self.ptr);
         }
     }
 }
@@ -172,6 +274,8 @@ fn set_decode_area(
         .checked_add(rect.height)
         .ok_or_else(|| anyhow!("OpenJPEG decode window y overflow"))?;
     let ok = unsafe {
+        // SAFETY: `codec` and `image` are owned by a live `Decoder`, and the
+        // window was checked for integer overflow before conversion.
         opj::opj_set_decode_area(
             codec,
             image,
@@ -191,11 +295,18 @@ unsafe fn info_from_image(image: *mut opj::opj_image_t) -> Result<OpenJpegInfo> 
     if image.is_null() {
         bail!("OpenJPEG returned a null image");
     }
+    // SAFETY: Null was rejected above and the image is owned by `Decoder`.
     let image_ref = unsafe { &*image };
     if image_ref.numcomps > 0 && image_ref.comps.is_null() {
         bail!("OpenJPEG returned image components without data");
     }
-    let comps = unsafe { std::slice::from_raw_parts(image_ref.comps, image_ref.numcomps as usize) };
+    let comps: &[opj::opj_image_comp_t] = if image_ref.numcomps == 0 {
+        &[]
+    } else {
+        // SAFETY: OpenJPEG reports `numcomps` elements at `comps`, and the
+        // non-null pointer case was validated above.
+        unsafe { std::slice::from_raw_parts(image_ref.comps, image_ref.numcomps as usize) }
+    };
     let components = comps
         .iter()
         .map(|component| OpenJpegComponentInfo {
@@ -223,11 +334,14 @@ unsafe fn image_to_rgba(
     if image.is_null() {
         bail!("OpenJPEG returned a null image");
     }
+    // SAFETY: Null was rejected above and the image is owned by `Decoder`.
     let image_ref = unsafe { &*image };
     if image_ref.numcomps == 0 || image_ref.comps.is_null() {
         bail!("OpenJPEG returned an image without components");
     }
 
+    // SAFETY: `numcomps > 0` and non-null `comps` were validated before
+    // constructing this slice.
     let comps = unsafe { std::slice::from_raw_parts(image_ref.comps, image_ref.numcomps as usize) };
     let width = comps[0].w;
     let height = comps[0].h;
@@ -235,6 +349,7 @@ unsafe fn image_to_rgba(
         bail!("OpenJPEG returned empty image components");
     }
 
+    // SAFETY: ICC buffer access is validated inside `OpenJpegColorTransform`.
     let color_transform = unsafe { OpenJpegColorTransform::new(image_ref, comps)? };
     let mut rgba = vec![255u8; width as usize * height as usize * 4];
     if let Some(transform) = color_transform {
@@ -337,6 +452,8 @@ fn component_view_sample_to_u8(
         .and_then(|base| base.checked_add(cx))
         .ok_or_else(|| anyhow!("OpenJPEG component index overflow"))?;
     let data = component.data_addr as *const i32;
+    // SAFETY: `ComponentView` is created only from non-null OpenJPEG component
+    // data. The index is bounded by component width/height above.
     let sample = unsafe { *data.add(index) };
     Ok(sample_to_u8(sample, component.precision, component.signed))
 }
@@ -374,6 +491,9 @@ impl OpenJpegColorTransform {
             _ => return Ok(None),
         };
 
+        // SAFETY: The ICC pointer is non-null and its length is non-zero as
+        // checked above. The profile buffer is owned by the OpenJPEG image and
+        // remains valid for the duration of transform construction.
         let icc_profile = unsafe {
             std::slice::from_raw_parts(image.icc_profile_buf, image.icc_profile_len as usize)
         };
@@ -501,6 +621,8 @@ fn component_sample(
         .checked_mul(component.w as usize)
         .and_then(|base| base.checked_add(cx))
         .ok_or_else(|| anyhow!("OpenJPEG component index overflow"))?;
+    // SAFETY: The component data pointer and dimensions were validated before
+    // sampling, and the computed index is within those dimensions.
     Ok(unsafe { *component.data.add(index) })
 }
 
@@ -550,4 +672,36 @@ fn is_raw_codestream(path: &Path) -> bool {
         .and_then(|ext| ext.to_str())
         .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "j2k" | "j2c" | "jpc"))
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reduce_factor_selects_power_of_two_level() {
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: 4096,
+            height: 2048,
+        };
+
+        assert_eq!(reduce_factor(rect, 4096, 2048), 0);
+        assert_eq!(reduce_factor(rect, 2048, 1024), 1);
+        assert_eq!(reduce_factor(rect, 512, 256), 3);
+    }
+
+    #[test]
+    fn reduce_factor_uses_smaller_axis_scale() {
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: 4096,
+            height: 2048,
+        };
+
+        assert_eq!(reduce_factor(rect, 1024, 2048), 0);
+        assert_eq!(reduce_factor(rect, 1024, 512), 2);
+    }
 }

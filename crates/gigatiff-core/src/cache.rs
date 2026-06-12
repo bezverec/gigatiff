@@ -64,3 +64,46 @@ impl ScanlineCache {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(y: u32) -> ScanlineKey {
+        ScanlineKey {
+            path: PathBuf::from("image.tif"),
+            y,
+            x: 0,
+            width: 16,
+            bytes_per_pixel: 3,
+        }
+    }
+
+    #[test]
+    fn scanline_cache_refreshes_recently_read_rows() {
+        let mut cache = ScanlineCache::new(6);
+        cache.insert(key(1), Arc::new(vec![1, 1, 1]));
+        cache.insert(key(2), Arc::new(vec![2, 2, 2]));
+
+        assert!(cache.get(&key(1)).is_some());
+        cache.insert(key(3), Arc::new(vec![3, 3, 3]));
+
+        assert!(cache.get(&key(1)).is_some());
+        assert!(cache.get(&key(2)).is_none());
+        assert!(cache.get(&key(3)).is_some());
+        assert_eq!(cache.bytes, 6);
+    }
+
+    #[test]
+    fn scanline_cache_replaces_rows_and_ignores_oversized_rows() {
+        let mut cache = ScanlineCache::new(5);
+        cache.insert(key(1), Arc::new(vec![1, 1, 1]));
+        cache.insert(key(1), Arc::new(vec![2, 2]));
+        cache.insert(key(2), Arc::new(vec![9; 6]));
+
+        let row = cache.get(&key(1)).unwrap();
+        assert_eq!(row.as_slice(), &[2, 2]);
+        assert!(cache.get(&key(2)).is_none());
+        assert_eq!(cache.bytes, 2);
+    }
+}
