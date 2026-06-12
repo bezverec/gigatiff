@@ -488,6 +488,23 @@ status, and any error text so failed OpenJPEG/Grok requests remain part of the b
 `-ViewerPrewarmDelayMs` additionally measures the opt-in viewer prewarm path by loading
 `/viewer/<id>?prewarm=1`, waiting for the configured delay, and then requesting the startup viewport.
 
+JPEG2000 backend quality checks compare a candidate server against an OpenJPEG reference server.
+The script requests the same IIIF PNG regions from both endpoints, stores both images, records
+timing headers, and fails when mean pixel difference or the ratio of visibly different pixels crosses
+the configured thresholds:
+
+```powershell
+.\scripts\test-jp2-artifacts.ps1 `
+    -CandidateBaseUrl http://127.0.0.1:18110 `
+    -ReferenceBaseUrl http://127.0.0.1:18111 `
+    -OutDir target\jp2-artifact-tests
+```
+
+Run the candidate with `--jp2-backend grok` to test Grok FFI directly, or with `--jp2-backend auto`
+to validate the production routing policy. `-IncludeFull512` and `-IncludeFull1024` add full-image
+thumbnail requests; the default focuses on region/tile requests because those are the viewer path
+most likely to expose JP2 tile artefacts.
+
 ## libtiff
 
 The build script links against libtiff through a platform-specific discovery path.
