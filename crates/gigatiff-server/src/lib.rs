@@ -4177,11 +4177,16 @@ fn encode_response(
         ImageFormat::Png => {
             let mut bytes = Vec::new();
             let mut encoder = png::Encoder::new(Cursor::new(&mut bytes), width, height);
-            encoder.set_color(png::ColorType::Rgba);
+            let rgb = rgba_is_opaque(rgba).then(|| rgba_to_rgb(rgba));
+            encoder.set_color(if rgb.is_some() {
+                png::ColorType::Rgb
+            } else {
+                png::ColorType::Rgba
+            });
             encoder.set_depth(png::BitDepth::Eight);
             encoder.set_compression(PngCompression::Fast.to_png());
             let mut writer = encoder.write_header()?;
-            writer.write_image_data(rgba)?;
+            writer.write_image_data(rgb.as_deref().unwrap_or(rgba))?;
             drop(writer);
             Ok((bytes, content_type(format)))
         }
@@ -4195,7 +4200,12 @@ fn encode_response(
         ImageFormat::Webp => {
             let mut bytes = Vec::new();
             let encoder = image::codecs::webp::WebPEncoder::new_lossless(&mut bytes);
-            encoder.write_image(rgba, width, height, ExtendedColorType::Rgba8)?;
+            if rgba_is_opaque(rgba) {
+                let rgb = rgba_to_rgb(rgba);
+                encoder.write_image(&rgb, width, height, ExtendedColorType::Rgb8)?;
+            } else {
+                encoder.write_image(rgba, width, height, ExtendedColorType::Rgba8)?;
+            }
             Ok((bytes, content_type(format)))
         }
     }
@@ -4226,6 +4236,10 @@ impl Fnv1a64 {
     fn finish(self) -> u64 {
         self.hash
     }
+}
+
+fn rgba_is_opaque(rgba: &[u8]) -> bool {
+    rgba.chunks_exact(4).all(|pixel| pixel[3] == 255)
 }
 
 fn rgba_to_rgb(rgba: &[u8]) -> Vec<u8> {
@@ -5495,6 +5509,26 @@ mod tests {
         let mut bitonal = vec![10, 20, 30, 255, 200, 200, 200, 128];
         apply_quality(&mut bitonal, "bitonal");
         assert_eq!(bitonal, vec![0, 0, 0, 255, 255, 255, 255, 128]);
+    }
+
+    #[test]
+    fn png_encoder_omits_alpha_for_opaque_rgba() {
+        let rgba = vec![255, 0, 0, 255, 0, 128, 255, 255];
+
+        let (bytes, content_type) = encode_response(&ImageFormat::Png, 2, 1, &rgba, 85).unwrap();
+
+        assert_eq!(content_type, "image/png");
+        assert_eq!(bytes[25], 2);
+    }
+
+    #[test]
+    fn png_encoder_keeps_alpha_for_transparent_rgba() {
+        let rgba = vec![255, 0, 0, 255, 0, 128, 255, 127];
+
+        let (bytes, content_type) = encode_response(&ImageFormat::Png, 2, 1, &rgba, 85).unwrap();
+
+        assert_eq!(content_type, "image/png");
+        assert_eq!(bytes[25], 6);
     }
 
     #[test]
