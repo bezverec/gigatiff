@@ -176,11 +176,13 @@ appropriate decode reduction. The command paths can be overridden with `GIGATIFF
 `GIGATIFF_GROK_DECOMPRESS`. Native non-container Linux deployments need `grokj2k-tools` installed.
 Grok is AGPL-licensed, so this backend is kept server-only and optional in Cargo builds.
 
-The Docker image enables `jpeg2000-grok-ffi`, which uses the direct Grok FFI backend for normal JP2
-region requests. JP2 files with large codestream tiles, such as the 4096 x 4096 master copies used in
-the local benchmark set, are routed through a direct OpenJPEG FFI fallback because Grok 20.3.3
-produced sparse gray-grid artefacts for those region/reduced decode requests. The fallback uses the
-Rust `openjpeg-sys` crate and does not spawn `opj_decompress` or write temporary PNM files.
+The Docker image enables `jpeg2000-grok-ffi`, which includes both the direct Grok FFI backend and
+the direct OpenJPEG FFI backend. The production default is the hybrid `auto` mode: OpenJPEG is used
+as the fast primary decoder and Grok remains available as a fallback or as an explicitly selected
+backend. Docker builds pin Grok to upstream commit
+`06c96bfbc38c74d386ce27018002d3febfff8f0c`, which includes the fix for lossy RPCL JP2 region/reduce
+artefacts seen with the earlier 20.3.x release builds. Both FFI paths avoid spawning external codec
+processes or writing temporary PNM files.
 
 The server stores encoded IIIF region/tile responses in a persistent cache. By default this is the
 local disk backend under `cache/server`; it can be changed with `--cache-dir`. The alternative
@@ -408,14 +410,14 @@ replace tags with image digests in your deployment environment.
 Example image build with SBOM/provenance:
 
 ```powershell
-.\scripts\build-server-image.ps1 -Image ghcr.io/bezverec/gigatiff-server:0.3.0
+.\scripts\build-server-image.ps1 -Image ghcr.io/bezverec/gigatiff-server:0.3.1
 ```
 
 Multi-arch publication can use the same helper when the builder supports the requested platforms:
 
 ```powershell
 .\scripts\build-server-image.ps1 `
-  -Image ghcr.io/bezverec/gigatiff-server:0.3.0 `
+  -Image ghcr.io/bezverec/gigatiff-server:0.3.1 `
   -Platform linux/amd64,linux/arm64 `
   -Push
 ```
