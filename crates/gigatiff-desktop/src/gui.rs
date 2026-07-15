@@ -78,7 +78,6 @@ struct ViewerApp {
     center_y: f64,
     view_width: f64,
     max_chunk_mb: usize,
-    last_drag_delta: egui::Vec2,
 }
 
 pub(crate) fn run_gui(path: Option<PathBuf>) -> Result<()> {
@@ -209,7 +208,6 @@ impl ViewerApp {
             center_y: 0.0,
             view_width: 1024.0,
             max_chunk_mb: 256,
-            last_drag_delta: egui::Vec2::ZERO,
         };
 
         if !app.path_input.trim().is_empty() {
@@ -645,12 +643,10 @@ impl ViewerApp {
         if available.x < 1.0 || available.y < 1.0 {
             return;
         }
-        let (canvas, response) = ui.allocate_exact_size(available, egui::Sense::drag());
-        self.last_canvas_size = canvas.size();
-        let painter = ui.painter_at(canvas);
-        painter.rect_filled(canvas, 0.0, egui::Color32::from_rgb(28, 30, 31));
-
         let (Some(info), Some(path)) = (self.info.clone(), self.path.clone()) else {
+            let (canvas, _) = ui.allocate_exact_size(available, egui::Sense::hover());
+            let painter = ui.painter_at(canvas);
+            painter.rect_filled(canvas, 0.0, egui::Color32::from_rgb(28, 30, 31));
             painter.text(
                 canvas.center(),
                 egui::Align2::CENTER_CENTER,
@@ -661,32 +657,95 @@ impl ViewerApp {
             return;
         };
 
-        if response.dragged() {
-            let delta = response.drag_delta() - self.last_drag_delta;
-            self.last_drag_delta = response.drag_delta();
-            let view = self.current_rect(&info, canvas.size());
-            self.center_x -= delta.x as f64 * view.width as f64 / canvas.width() as f64;
-            self.center_y -= delta.y as f64 * view.height as f64 / canvas.height() as f64;
-            self.view_mode = ViewMode::Free;
-            self.last_request = None;
-        } else {
-            self.last_drag_delta = egui::Vec2::ZERO;
+        if self.view_mode == ViewMode::FitImage {
+            let (canvas, response) = ui.allocate_exact_size(available, egui::Sense::hover());
+            self.last_canvas_size = canvas.size();
+            if response.hovered() {
+                let scroll = ui.input(|input| input.smooth_scroll_delta.y);
+                if scroll.abs() > 0.1 {
+                    self.zoom(0.998_f64.powf(scroll as f64));
+                }
+            }
+            self.render_viewport(ui, ctx, canvas, &info, &path);
+            return;
         }
 
-        if response.hovered() {
+        // A real scroll area keeps the scrollbar thumbs, drag-to-pan gesture and rendered
+        // source rectangle on one shared offset. The previous canvas-only drag handler had
+        // no scroll state and could therefore leave a zoomed image apparently locked.
+        let scroll_style = egui::style::ScrollStyle::solid();
+        let bar_use =
+            scroll_style.bar_width + scroll_style.bar_inner_margin + scroll_style.bar_outer_margin;
+        let scroll_axes = self.scroll_axes(&info, available, bar_use);
+        let predicted_canvas = egui::vec2(
+            (available.x - if scroll_axes[1] { bar_use } else { 0.0 }).max(1.0),
+            (available.y - if scroll_axes[0] { bar_use } else { 0.0 }).max(1.0),
+        );
+        let requested_offset = self.scroll_offset(&info, predicted_canvas);
+
+        let previous_scroll_style = ui.style().spacing.scroll;
+        ui.style_mut().spacing.scroll = scroll_style;
+        let output = egui::ScrollArea::new(scroll_axes)
+            .id_salt("image_viewport")
+            .auto_shrink([false, false])
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+            .scroll_source(
+                egui::scroll_area::ScrollSource::SCROLL_BAR | egui::scroll_area::ScrollSource::DRAG,
+            )
+            .horizontal_scroll_offset(requested_offset.x)
+            .vertical_scroll_offset(requested_offset.y)
+            .on_hover_cursor(egui::CursorIcon::Grab)
+            .on_drag_cursor(egui::CursorIcon::Grabbing)
+            .show_viewport(ui, |ui, _viewport| {
+                let canvas = ui.clip_rect();
+                self.last_canvas_size = canvas.size();
+                let content_size = self.scroll_content_size(&info, canvas.size());
+                ui.allocate_space(content_size);
+                self.render_viewport(ui, ctx, canvas, &info, &path);
+            });
+        ui.style_mut().spacing.scroll = previous_scroll_style;
+
+        let old_center = (self.center_x, self.center_y);
+        self.set_center_from_scroll(&info, output.inner_rect.size(), output.state.offset);
+        if (self.center_x - old_center.0).abs() > 0.01
+            || (self.center_y - old_center.1).abs() > 0.01
+        {
+            self.view_mode = ViewMode::Free;
+            self.last_request = None;
+            ctx.request_repaint();
+        }
+
+        if ui.input(|input| {
+            input
+                .pointer
+                .hover_pos()
+                .is_some_and(|position| output.inner_rect.contains(position))
+        }) {
             let scroll = ui.input(|input| input.smooth_scroll_delta.y);
             if scroll.abs() > 0.1 {
                 self.zoom(0.998_f64.powf(scroll as f64));
             }
         }
+    }
+
+    fn render_viewport(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        canvas: egui::Rect,
+        info: &ImageInfo,
+        path: &Path,
+    ) {
+        let painter = ui.painter_at(canvas);
+        painter.rect_filled(canvas, 0.0, egui::Color32::from_rgb(28, 30, 31));
 
         let source_rect = self.current_rect(&info, canvas.size());
-        let image_rect = self.image_display_rect(canvas, &info);
+        let image_rect = self.image_display_rect(canvas, info);
         let max_output = (image_rect.width().max(image_rect.height()) * ctx.pixels_per_point())
             .round()
             .clamp(256.0, 2048.0) as u32;
         let request = PreviewRequest {
-            path: path.clone(),
+            path: path.to_path_buf(),
             rect: source_rect,
             max_output,
             backend: Backend::Auto,
@@ -696,14 +755,14 @@ impl ViewerApp {
         }
         self.last_request = Some(request);
 
-        self.draw_overview_texture(&painter, image_rect, source_rect, &info);
+        self.draw_overview_texture(&painter, image_rect, source_rect, info);
         if self.view_mode == ViewMode::FitImage {
-            self.queue_overview_render(&path, &info);
+            self.queue_overview_render(path, info);
         }
 
         let tiles = visible_tile_requests(
-            &path,
-            &info,
+            path,
+            info,
             source_rect,
             image_rect,
             ctx.pixels_per_point(),
@@ -754,7 +813,7 @@ impl ViewerApp {
 
                 if self.queue_render(
                     tile_request.clone(),
-                    &info,
+                    info,
                     format!(
                         "Rendering visible tiles {}/{} with {} workers (x={} y={} w={} h={})...",
                         rendered_tiles + queued_tiles + 1,
@@ -778,8 +837,8 @@ impl ViewerApp {
 
             if slots > 0 {
                 for tile_request in prefetch_tile_requests(
-                    &path,
-                    &info,
+                    path,
+                    info,
                     source_rect,
                     image_rect,
                     ctx.pixels_per_point(),
@@ -793,7 +852,7 @@ impl ViewerApp {
                     {
                         if self.queue_render(
                             tile_request.clone(),
-                            &info,
+                            info,
                             format!(
                                 "Prefetching nearby tiles with {} workers (x={} y={} w={} h={})...",
                                 self.render_worker_count,
@@ -912,6 +971,87 @@ impl ViewerApp {
         )
     }
 
+    fn view_dimensions(&self, info: &ImageInfo, canvas_size: egui::Vec2) -> (f64, f64) {
+        if self.view_mode == ViewMode::FitImage {
+            return (info.width as f64, info.height as f64);
+        }
+
+        let aspect = (canvas_size.x.max(1.0) / canvas_size.y.max(1.0)) as f64;
+        let mut width = self.view_width.clamp(1.0, info.width as f64);
+        let mut height = width / aspect;
+
+        if height > info.height as f64 {
+            height = info.height as f64;
+            width = (height * aspect).min(info.width as f64);
+        }
+
+        (width, height)
+    }
+
+    fn scroll_axes(&self, info: &ImageInfo, available: egui::Vec2, bar_use: f32) -> [bool; 2] {
+        let mut axes = [false, false];
+
+        // A solid bar reduces the other axis, which can make that axis scrollable too.
+        // Iterate to the stable pair so the bars do not flicker when one first appears.
+        for _ in 0..3 {
+            let canvas_size = egui::vec2(
+                (available.x - if axes[1] { bar_use } else { 0.0 }).max(1.0),
+                (available.y - if axes[0] { bar_use } else { 0.0 }).max(1.0),
+            );
+            let (view_width, view_height) = self.view_dimensions(info, canvas_size);
+            let next = [
+                view_width < info.width as f64 - 0.5,
+                view_height < info.height as f64 - 0.5,
+            ];
+            if next == axes {
+                break;
+            }
+            axes = next;
+        }
+
+        axes
+    }
+
+    fn scroll_content_size(&self, info: &ImageInfo, canvas_size: egui::Vec2) -> egui::Vec2 {
+        let (view_width, _) = self.view_dimensions(info, canvas_size);
+        let scale = canvas_size.x.max(1.0) as f64 / view_width.max(1.0);
+        egui::vec2(
+            (info.width as f64 * scale) as f32,
+            (info.height as f64 * scale) as f32,
+        )
+        .max(canvas_size)
+    }
+
+    fn scroll_offset(&self, info: &ImageInfo, canvas_size: egui::Vec2) -> egui::Vec2 {
+        let (view_width, view_height) = self.view_dimensions(info, canvas_size);
+        let content_size = self.scroll_content_size(info, canvas_size);
+        let scale = canvas_size.x.max(1.0) as f64 / view_width.max(1.0);
+        let max_offset = (content_size - canvas_size).max(egui::Vec2::ZERO);
+
+        egui::vec2(
+            ((self.center_x - view_width / 2.0) * scale) as f32,
+            ((self.center_y - view_height / 2.0) * scale) as f32,
+        )
+        .clamp(egui::Vec2::ZERO, max_offset)
+    }
+
+    fn set_center_from_scroll(
+        &mut self,
+        info: &ImageInfo,
+        canvas_size: egui::Vec2,
+        offset: egui::Vec2,
+    ) {
+        let (view_width, view_height) = self.view_dimensions(info, canvas_size);
+        let scale = canvas_size.x.max(1.0) as f64 / view_width.max(1.0);
+        let half_width = view_width / 2.0;
+        let half_height = view_height / 2.0;
+
+        self.center_x = (offset.x as f64 / scale + half_width)
+            .clamp(half_width, info.width as f64 - half_width);
+        self.center_y = (offset.y as f64 / scale + half_height)
+            .clamp(half_height, info.height as f64 - half_height);
+    }
+
     fn current_rect(&self, info: &ImageInfo, canvas_size: egui::Vec2) -> Rect {
         if self.view_mode == ViewMode::FitImage {
             return Rect {
@@ -922,18 +1062,7 @@ impl ViewerApp {
             };
         }
 
-        let aspect = (canvas_size.x.max(1.0) / canvas_size.y.max(1.0)) as f64;
-        let mut width = match self.view_mode {
-            ViewMode::FitImage => info.width as f64,
-            ViewMode::ActualSize | ViewMode::Free => self.view_width,
-        }
-        .clamp(1.0, info.width as f64);
-        let mut height = width / aspect;
-
-        if height > info.height as f64 {
-            height = info.height as f64;
-            width = (height * aspect).min(info.width as f64);
-        }
+        let (width, height) = self.view_dimensions(info, canvas_size);
 
         let half_w = width / 2.0;
         let half_h = height / 2.0;
@@ -1415,5 +1544,41 @@ mod tests {
         assert_eq!(fit.width(), 500.0);
         assert_eq!(fit.height(), 500.0);
         assert_eq!(fit.center(), canvas.center());
+    }
+
+    #[test]
+    fn scrollbar_offset_round_trips_center_and_clamps_to_edges() {
+        let info = dummy_info(4000, 3000);
+        let canvas = egui::vec2(800.0, 600.0);
+        let mut app = ViewerApp::new(None, egui::Context::default());
+        app.view_mode = ViewMode::Free;
+        app.view_width = 1000.0;
+        app.center_x = 2000.0;
+        app.center_y = 1500.0;
+
+        assert_eq!(
+            app.scroll_axes(&info, egui::vec2(810.0, 610.0), 10.0),
+            [true, true]
+        );
+
+        let offset = app.scroll_offset(&info, canvas);
+        assert_eq!(offset, egui::vec2(1200.0, 900.0));
+
+        app.center_x = 0.0;
+        app.center_y = 0.0;
+        app.set_center_from_scroll(&info, canvas, offset);
+        assert!((app.center_x - 2000.0).abs() < 0.001);
+        assert!((app.center_y - 1500.0).abs() < 0.001);
+
+        app.set_center_from_scroll(&info, canvas, egui::Vec2::ZERO);
+        assert!((app.center_x - 500.0).abs() < 0.001);
+        assert!((app.center_y - 375.0).abs() < 0.001);
+
+        app.set_center_from_scroll(&info, canvas, egui::vec2(2400.0, 1800.0));
+        assert!((app.center_x - 3500.0).abs() < 0.001);
+        assert!((app.center_y - 2625.0).abs() < 0.001);
+
+        app.view_mode = ViewMode::FitImage;
+        assert_eq!(app.scroll_axes(&info, canvas, 10.0), [false, false]);
     }
 }
