@@ -62,7 +62,9 @@ jobs:
         shell: pwsh
         run: |
           vcpkg install tiff:x64-windows lcms:x64-windows
-          "LIBTIFF_DIR=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows" | Out-File -FilePath $env:GITHUB_ENV -Append
+          $vcpkgRoot = Join-Path $env:VCPKG_INSTALLATION_ROOT "installed\x64-windows"
+          "LIBTIFF_DIR=$vcpkgRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
+          (Join-Path $vcpkgRoot "bin") | Out-File -FilePath $env:GITHUB_PATH -Append
 
       - name: Check
         run: cargo check --locked
