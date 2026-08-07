@@ -179,9 +179,10 @@ Grok is AGPL-licensed, so this backend is kept server-only and optional in Cargo
 The Docker image enables `jpeg2000-grok-ffi`, which includes both the direct Grok FFI backend and
 the direct OpenJPEG FFI backend. The production default is the hybrid `auto` mode: OpenJPEG is used
 as the fast primary decoder and Grok remains available as a fallback or as an explicitly selected
-backend. Docker builds pin Grok to upstream commit
-`06c96bfbc38c74d386ce27018002d3febfff8f0c`, which includes the fix for lossy RPCL JP2 region/reduce
-artefacts seen with the earlier 20.3.x release builds. Both FFI paths avoid spawning external codec
+backend. Docker builds pin Grok to upstream release `v20.3.9` (commit
+`2cfb60744113c36cdf3e7357b8959f45c5d717d1`), which includes the fix for lossy RPCL JP2
+region/reduce artefacts seen with the earlier 20.3.x release builds plus upstream decompressor
+stability fixes from the 20.3.9 release. Both FFI paths avoid spawning external codec
 processes or writing temporary PNM files.
 
 The server stores encoded IIIF region/tile responses in a persistent cache. By default this is the
@@ -410,14 +411,14 @@ replace tags with image digests in your deployment environment.
 Example image build with SBOM/provenance:
 
 ```powershell
-.\scripts\build-server-image.ps1 -Image ghcr.io/bezverec/gigatiff-server:0.3.1
+.\scripts\build-server-image.ps1 -Image ghcr.io/bezverec/gigatiff-server:0.3.2
 ```
 
 Multi-arch publication can use the same helper when the builder supports the requested platforms:
 
 ```powershell
 .\scripts\build-server-image.ps1 `
-  -Image ghcr.io/bezverec/gigatiff-server:0.3.1 `
+  -Image ghcr.io/bezverec/gigatiff-server:0.3.2 `
   -Platform linux/amd64,linux/arm64 `
   -Push
 ```
