@@ -1,11 +1,11 @@
 # syntax=docker/dockerfile:1
 
-ARG RUST_IMAGE=rust:1.96.0-trixie
+ARG RUST_IMAGE=rust:1.97.1-trixie
 ARG DEBIAN_RUNTIME_IMAGE=debian:trixie-slim
 FROM ${RUST_IMAGE} AS build
 
 ARG GROK_REPOSITORY=https://github.com/GrokImageCompression/grok.git
-ARG GROK_REF=v20.3.9
+ARG GROK_REF=v20.3.10
 ARG GIGATIFF_BUILD_GROK=1
 ARG GIGATIFF_SERVER_FEATURES=jpeg2000-grok-ffi
 ARG GIGATIFF_BUILD_JOBS=2
