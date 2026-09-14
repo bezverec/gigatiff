@@ -177,13 +177,13 @@ appropriate decode reduction. The command paths can be overridden with `GIGATIFF
 Grok is AGPL-licensed, so this backend is kept server-only and optional in Cargo builds.
 
 The Docker image enables `jpeg2000-grok-ffi`, which includes both the direct Grok FFI backend and
-the direct OpenJPEG FFI backend. The production default is the hybrid `auto` mode: OpenJPEG is used
-as the fast primary decoder and Grok remains available as a fallback or as an explicitly selected
-backend. Docker builds pin Grok to upstream release `v20.3.10` (commit
-`3c4b4d7037e5b23dec0b73ef326fc60de0bd6e6b`), which includes the fix for lossy RPCL JP2
-region/reduce artefacts seen with the earlier 20.3.x release builds plus upstream decompressor
-stability fixes from the 20.3.x releases. Both FFI paths avoid spawning external codec
-processes or writing temporary PNM files.
+the direct OpenJPEG FFI backend. The production default is the hybrid `auto` mode: Grok handles
+reduced JP2 regions, while OpenJPEG handles full-resolution requests and large-tile master files;
+either backend can also be selected explicitly. Docker builds pin Grok to upstream release `v20.4.9` (commit
+`7c6418e7a0eadf59e8e7178d43fea96fbd782c3b`), which retains the lossy RPCL
+region/reduce fix and adds substantial windowed/reduced decode, threading, memory-use, and
+malformed-stream hardening from the 20.4.x series. Both FFI paths avoid spawning external
+codec processes or writing temporary PNM files.
 
 The server stores encoded IIIF region/tile responses in a persistent cache. By default this is the
 local disk backend under `cache/server`; it can be changed with `--cache-dir`. The alternative
@@ -337,12 +337,12 @@ gigatiff-server --jp2-backend grok
 gigatiff-server --jp2-backend openjpeg
 ```
 
-`auto` is the default. In the hybrid `jpeg2000-grok-ffi` build it chooses OpenJPEG FFI for JP2
-codestreams whose tile width or height is at least 4096 px, because those NDK-style master files are
-the cases where Grok 20.3.3 returned sparse gray-grid region output in local testing. Other JP2
-files use Grok FFI because it is faster for the 1024 x 1024 tiled user-copy samples. If an auto
-Grok render fails and OpenJPEG FFI is available, the server retries through OpenJPEG FFI. The actual
-backend used for an IIIF image response is reported in `x-gigatiff-jp2-backend`.
+`auto` is the default. In the hybrid `jpeg2000-grok-ffi` build it chooses OpenJPEG FFI for
+full-resolution requests and for JP2 codestreams whose tile width or height is at least 4096 px.
+Reduced regions from smaller-tile JP2 files use Grok FFI. This keeps the detail path conservative
+while retaining Grok's strong reduced-region performance. If a Grok render fails and OpenJPEG FFI is
+available, the server retries through OpenJPEG FFI. The actual backend used for an IIIF image
+response is reported in `x-gigatiff-jp2-backend`.
 
 `--openjpeg-threads` controls the maximum thread count used inside each OpenJPEG FFI region decode.
 The server may choose a lower count for small or heavily downsampled OpenJPEG requests, while keeping
@@ -403,7 +403,7 @@ The repository includes first-pass production deployment templates under `ops/`:
 - `scripts/build-server-image.ps1` builds the server image with Docker BuildKit SBOM and provenance
   attestations enabled.
 
-The Dockerfile uses Debian Trixie for both build and runtime stages (`rust:1.97.1-trixie` and
+The Dockerfile uses Debian Trixie for both build and runtime stages (`rust:1.98.1-trixie` and
 `debian:trixie-slim`) and exposes `/healthz` as the image healthcheck. The Compose templates pin
 Caddy and Dragonfly to explicit tags instead of `latest`; for stricter production reproducibility,
 replace tags with image digests in your deployment environment.
@@ -411,14 +411,14 @@ replace tags with image digests in your deployment environment.
 Example image build with SBOM/provenance:
 
 ```powershell
-.\scripts\build-server-image.ps1 -Image ghcr.io/bezverec/gigatiff-server:0.3.3
+.\scripts\build-server-image.ps1 -Image ghcr.io/bezverec/gigatiff-server:0.3.4
 ```
 
 Multi-arch publication can use the same helper when the builder supports the requested platforms:
 
 ```powershell
 .\scripts\build-server-image.ps1 `
-  -Image ghcr.io/bezverec/gigatiff-server:0.3.3 `
+  -Image ghcr.io/bezverec/gigatiff-server:0.3.4 `
   -Platform linux/amd64,linux/arm64 `
   -Push
 ```
@@ -709,15 +709,16 @@ repeated tile/region requests can skip TIFF reads, sampling, color conversion, a
 
 For JPEG2000 sources, the optional Grok CLI backend decodes only the requested IIIF region through
 `grk_decompress` and chooses a JPEG2000 reduction level when the requested output is substantially
-smaller than the source region. The Docker/default server image uses the direct Grok FFI backend for
-ordinary JP2 region requests to avoid process spawning and temporary PNM files.
+smaller than the source region. The Docker/default server image uses direct Grok FFI for reduced JP2
+region requests and direct OpenJPEG FFI for full-resolution or large-tile requests, avoiding process
+spawning and temporary PNM files on both paths.
 
-Large-tile JP2 master copies are a special case. Grok 20.3.3 can report successful region/reduced
-decodes for 4096 x 4096 tiled master files while returning sparse gray-grid image data. For those
-sources, the hybrid server falls back to the direct OpenJPEG FFI backend, then applies the same IIIF
-geometry, quality conversion, encoding, and persistent response cache used by TIFF responses. First
-requests for those master tiles are slower than TIFF and Grok user-copy JP2 tiles, but warm requests
-are served from the encoded response cache.
+Large-tile JP2 master copies remain a conservative special case. Although the upstream Grok fix and
+the `20.4.9` artifact suite now produce continuous output, the hybrid server still routes 4096 x 4096
+master tiles through direct OpenJPEG FFI. It then applies the same IIIF geometry, quality conversion,
+encoding, and persistent response cache used by TIFF responses. First requests for those master
+tiles are slower than TIFF and reduced Grok user-copy requests, but warm requests are served from the
+encoded response cache.
 
 The OpenJPEG FFI path reads embedded JP2 ICC profiles and converts decoded Gray/RGB 8-bit and 16-bit
 samples to sRGB through `lcms2`. The persistent response cache namespace is bumped when this color
@@ -815,6 +816,26 @@ single-threaded TIFF decode path and source-row cache, while the scheduler prior
 closest to the center of the viewport before filling edges and prefetching nearby tiles.
 
 ### Server Benchmarks
+
+Grok `20.4.9` was validated on Linux against OpenJPEG and the previous Grok `20.3.10` image before
+the `0.3.4` update. Five JP2 files, including the earlier lossy RPCL regression sample, were tested
+across six full-image and regional request shapes. All 30 pixel comparisons passed against both
+references. The first-load benchmark below used three JP2 files, lossless WebP output, disabled
+persistent response caching, and reports mean cold-request time over the three files:
+
+```text
+request                   Grok 20.4.9   Grok 20.3.10   OpenJPEG
+advertised tile                96.3 ms        154.8 ms     101.0 ms
+512 -> 128                     28.9 ms         35.3 ms      27.0 ms
+4096 -> 512                   316.1 ms        254.5 ms     249.4 ms
+full -> 512                   280.7 ms        281.1 ms     276.5 ms
+full -> 1024                  790.6 ms        755.3 ms     754.8 ms
+```
+
+The new Grok release materially improves the small reduced-region paths used during initial viewer
+navigation, while the hybrid `auto` policy keeps OpenJPEG on full-resolution and large-tile paths
+where it remains faster or more conservative. Results are workload and host dependent; use
+`scripts/bench-jp2-firstload.ps1` with deployment samples before changing the backend policy.
 
 Server benchmark through Docker Compose and Caddy on `http://127.0.0.1:18082`, requesting a
 512 x 512 source region scaled to 128 px output. The benchmark used
@@ -1191,8 +1212,8 @@ cargo build --release -p gigatiff-desktop --bin gigatiff
 ### Server
 
 - serves TIFF/BigTIFF files through a separate IIIF-compatible `gigatiff-server` binary,
-- serves JPEG2000 through Grok CLI/FFI feature builds, with an OpenJPEG fallback for large-tile JP2
-  master files that Grok 20.3.3 does not region-decode correctly,
+- serves JPEG2000 through Grok CLI/FFI feature builds, with the production hybrid policy retaining
+  OpenJPEG as the primary backend and Grok as a tested fallback,
 - provides a minimal OpenSeadragon browser viewer,
 - targets IIIF Image API 3.0 `level2` with region, size, rotation, mirroring, color/gray/bitonal
   quality, preferred-sizes, profile-link, canonical-link, and base-URI redirect coverage,
@@ -1227,13 +1248,11 @@ Useful next steps for the desktop viewer:
 
 Useful next steps for the image server:
 
-- keep the Grok FFI backend as the default Docker path and preserve the CLI backend as a fallback
-  build feature,
-- add CI coverage for `gigatiff-server --features jpeg2000-grok-ffi` in a Linux container with upstream Grok installed,
-- benchmark the direct OpenJPEG FFI fallback in the Linux/Docker hybrid build across master files,
-  overview requests, output sizes, and repeated warm-cache OpenSeadragon navigation,
-- investigate whether Grok has a newer region-decode path or parameter set that fixes sparse
-  gray-grid output for 4096 x 4096 RPCL master codestreams,
+- preserve the tested hybrid `auto` policy and keep the CLI backend as a fallback build feature,
+- add CI artifact coverage for `gigatiff-server --features jpeg2000-grok-ffi` in a Linux container
+  with representative reduced, full-resolution, small-tile, and 4096 px master requests,
+- extend the Grok 20.4.9/OpenJPEG benchmark across more archival masters, output sizes, and repeated
+  warm-cache OpenSeadragon navigation before relaxing conservative backend routing,
 - tune the direct OpenJPEG FFI path further, especially adaptive thread count, reduction choice, and
   component conversion cost,
 - add earlier first-load prewarm triggers for the web UI, starting with image-list hover/focus and an
