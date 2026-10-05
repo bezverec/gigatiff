@@ -179,11 +179,10 @@ Grok is AGPL-licensed, so this backend is kept server-only and optional in Cargo
 The Docker image enables `jpeg2000-grok-ffi`, which includes both the direct Grok FFI backend and
 the direct OpenJPEG FFI backend. The production default is the hybrid `auto` mode: Grok handles
 reduced JP2 regions, while OpenJPEG handles full-resolution requests and large-tile master files;
-either backend can also be selected explicitly. Docker builds pin Grok to upstream release `v20.4.12`
-(annotated tag `67d8e99dc1a7669c60a761a39a03cb0e7e6865bc`, source commit
-`dfb9ad428d7e0a65b267b53f88ac3ae2d91e1c43`), which retains the lossy RPCL
-region/reduce fix and adds substantial windowed/reduced decode, threading, memory-use, and
-malformed-stream hardening from the 20.4.x series. Both FFI paths avoid spawning external
+either backend can also be selected explicitly. Docker builds pin Grok to upstream release `v20.4.15`
+(source commit `cadd794339974e9350bbfc9db6e5756d3d25b07d`), which retains the lossy RPCL
+region/reduce fix and adds memory, thread-affinity, plugin-fallback and precinct-intersection fixes
+from the 20.4.x series. Both FFI paths avoid spawning external
 codec processes or writing temporary PNM files.
 
 The server stores encoded IIIF region/tile responses in a persistent cache. By default this is the
@@ -412,14 +411,14 @@ replace tags with image digests in your deployment environment.
 Example image build with SBOM/provenance:
 
 ```powershell
-.\scripts\build-server-image.ps1 -Image ghcr.io/bezverec/gigatiff-server:0.3.5
+.\scripts\build-server-image.ps1 -Image ghcr.io/bezverec/gigatiff-server:0.3.6
 ```
 
 Multi-arch publication can use the same helper when the builder supports the requested platforms:
 
 ```powershell
 .\scripts\build-server-image.ps1 `
-  -Image ghcr.io/bezverec/gigatiff-server:0.3.5 `
+  -Image ghcr.io/bezverec/gigatiff-server:0.3.6 `
   -Platform linux/amd64,linux/arm64 `
   -Push
 ```
@@ -715,7 +714,7 @@ region requests and direct OpenJPEG FFI for full-resolution or large-tile reques
 spawning and temporary PNM files on both paths.
 
 Large-tile JP2 master copies remain a conservative special case. Although the upstream Grok fix and
-the `20.4.12` artifact suite produce continuous output, the hybrid server still routes 4096 x 4096
+the `20.4.15` artifact suite produce continuous output, the hybrid server still routes 4096 x 4096
 master tiles through direct OpenJPEG FFI. It then applies the same IIIF geometry, quality conversion,
 encoding, and persistent response cache used by TIFF responses. First requests for those master
 tiles are slower than TIFF and reduced Grok user-copy requests, but warm requests are served from the
@@ -817,6 +816,48 @@ single-threaded TIFF decode path and source-row cache, while the scheduler prior
 closest to the center of the viewport before filling edges and prefetching nearby tiles.
 
 ### Server Benchmarks
+
+Grok `20.4.15` was tested on 2026-10-05 for GigaTIFF `0.3.6`. All 60 Linux core/server
+unit tests passed with `jpeg2000-grok-ffi`. The six-file JP2 suite passed all 36 comparisons
+against OpenJPEG (maximum channel delta 1) and all 36 against Grok `20.4.12` with exact
+pixel equality. It covers the original small lossy RPCL regression, another NDK sample,
+and two master/user-copy pairs. It does not include the multi-gigabyte `mapa2` masters.
+
+The following first-load measurements compare freshly run containers on the same ZimaBoard,
+using lossless WebP, four parallel batch requests, four OpenJPEG threads and disabled persistent
+response caching. Values are median client-side times across six files, one pass per backend.
+"Cold" means no encoded response-cache hit, not a flushed OS page cache. Other services were
+running on the host, so these are a maintenance-release smoke benchmark, not statistical proof
+of a general speedup:
+
+```text
+request                         auto 20.4.15   Grok 20.4.15   Grok 20.4.12   OpenJPEG
+full -> 512                         165.1 ms        146.2 ms       163.0 ms     112.5 ms
+full -> 1024                        423.5 ms        485.9 ms       599.2 ms     343.7 ms
+512 -> 128                           21.5 ms         23.8 ms        25.9 ms      17.4 ms
+4096 -> 512                         120.3 ms        187.6 ms       172.3 ms     133.2 ms
+advertised tile                      94.1 ms        140.3 ms       159.9 ms     101.7 ms
+startup batch, 512 -> 128            95.9 ms        103.2 ms       103.2 ms      91.5 ms
+startup viewport                    303.4 ms        264.6 ms       393.5 ms     268.6 ms
+prewarmed startup viewport          228.7 ms        330.7 ms       297.6 ms     287.0 ms
+```
+
+Grok improved several first-load medians in this run, but large-region and prewarmed requests
+did not consistently improve. OpenJPEG remains faster for many standalone decodes; the hybrid
+`auto` policy remains the default. Repeat with representative production masters and multiple
+interleaved runs before changing backend routing.
+
+Reproduce the artifact and first-load checks against separately started containers with the
+same read-only sample directory (the sample files themselves are not committed):
+
+```powershell
+$ids = 'cnb_user_bug.jp2', 'mc_vkol-00b10d_0001.jp2', 'newspaper_master.jp2',
+       'newspaper_user.jp2', 'small_master.jp2', 'small_user.jp2'
+.\scripts\test-jp2-artifacts.ps1 -ImageIds $ids -IncludeFull512 `
+  -CandidateBaseUrl http://127.0.0.1:18110 -ReferenceBaseUrl http://127.0.0.1:18112
+.\scripts\bench-jp2-firstload.ps1 -ImageIds $ids -BatchCount 4 `
+  -BaseUrl http://127.0.0.1:18110 -OutDir target/server-benchmarks-jp2-20.4.15-grok
+```
 
 Grok `20.4.12` was validated on Linux before the `0.3.5` update. The suite used six independent JP2
 files: the earlier lossy RPCL regression sample, another NDK sample, two master/user-copy pairs from
@@ -1281,7 +1322,7 @@ Useful next steps for the image server:
 - preserve the tested hybrid `auto` policy and keep the CLI backend as a fallback build feature,
 - add CI artifact coverage for `gigatiff-server --features jpeg2000-grok-ffi` in a Linux container
   with representative reduced, full-resolution, small-tile, and 4096 px master requests,
-- extend the Grok 20.4.9/OpenJPEG benchmark across more archival masters, output sizes, and repeated
+- extend the Grok 20.4.15/OpenJPEG benchmark across more archival masters, output sizes, and repeated
   warm-cache OpenSeadragon navigation before relaxing conservative backend routing,
 - tune the direct OpenJPEG FFI path further, especially adaptive thread count, reduction choice, and
   component conversion cost,

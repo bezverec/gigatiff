@@ -200,7 +200,7 @@ jobs:
           draft: false
           prerelease: true
           body: |
-            First prerelease build of GigaTIFF.
+            GigaTIFF ${{ github.ref_name }} desktop prerelease.
 
             Included archives:
 
