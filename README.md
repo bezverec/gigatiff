@@ -179,11 +179,34 @@ Grok is AGPL-licensed, so this backend is kept server-only and optional in Cargo
 The Docker image enables `jpeg2000-grok-ffi`, which includes both the direct Grok FFI backend and
 the direct OpenJPEG FFI backend. The production default is the hybrid `auto` mode: Grok handles
 reduced JP2 regions, while OpenJPEG handles full-resolution requests and large-tile master files;
-either backend can also be selected explicitly. Docker builds pin Grok to upstream release `v20.4.15`
-(source commit `cadd794339974e9350bbfc9db6e5756d3d25b07d`), which retains the lossy RPCL
+either backend can also be selected explicitly. Docker builds pin Grok to upstream release `v20.4.19`
+(annotated tag `6bc4e60c1c32c205705c8c67126babb157b17f16`, source commit
+`31ae6fa25be3747370b47a65d311e355f2adb33f`), which retains the lossy RPCL
 region/reduce fix and adds memory, thread-affinity, plugin-fallback and precinct-intersection fixes
 from the 20.4.x series. Both FFI paths avoid spawning external
 codec processes or writing temporary PNM files.
+
+The `0.3.7` local candidate refreshes the Rust workspace dependencies and builds
+with Rust `1.99.1` on Debian Trixie. The runtime uses the dated Debian image
+`trixie-20261020-slim` and copies Grok executables, libraries and shared resources,
+not the Rust toolchain or Cargo caches. This candidate has not been published to
+GHCR; `ghcr.io/bezverec/gigatiff-server:0.3.6` remains the latest published image.
+The local Docker image size is about 167 MB, down from 1.20 GB for `0.3.6`
+(Docker-reported image size, not compressed registry transfer size).
+The image defaults to `GRK_MERCURY=0`: classic Grok FFI avoids the embedded
+Mercury latency regression measured on the six-file JP2 suite. This does not
+switch decoding to OpenJPEG; the server's hybrid `auto` policy is unchanged.
+Use `docker run -e GRK_MERCURY=1 ...` for an explicit Mercury comparison.
+Large-master and native-Linux deployment validation remain separate from the
+local benchmark results in [the investigation report](docs/benchmarks/2026-10-22-grok.md).
+For a fully local build and full workspace test run:
+
+```powershell
+docker buildx build --target verify --output type=cacheonly `
+  --build-arg GIGATIFF_BUILD_JOBS=4 .
+docker build --pull --build-arg GIGATIFF_BUILD_JOBS=4 `
+  -t localhost/gigatiff-server:0.3.7 -t gigatiff-server:local .
+```
 
 The server stores encoded IIIF region/tile responses in a persistent cache. By default this is the
 local disk backend under `cache/server`; it can be changed with `--cache-dir`. The alternative
@@ -817,6 +840,79 @@ closest to the center of the viewport before filling edges and prefetching nearb
 
 ### Server Benchmarks
 
+#### Local 0.3.7 Candidate (2026-10-22)
+
+The locally built candidate uses Grok `20.4.19`, Rust `1.99.1` and the refreshed
+workspace dependencies. All 67 Linux workspace tests passed: 13 core, 6 desktop
+and 48 server tests. The Windows workspace also passed `cargo check --locked
+--workspace`; the desktop GUI was not runtime-tested in this container exercise.
+
+Six small/medium JP2 files were tested with full-image, reduced, full-resolution,
+center and edge requests (36 requests per suite). Direct Grok and hybrid `auto`
+outputs passed comparison with OpenJPEG with maximum channel delta 1 and no
+pixels exceeding that tolerance. Lossless master outputs matched exactly;
+lossy outputs can differ by one level because of decoder rounding. Do not
+interpret the whole suite as pixel-identical. The multi-gigabyte `mapa2` masters
+were unavailable on this PC and are not covered by this run.
+
+Grok now receives `num_threads = 1` per codec, requesting an independent inline
+executor instead of sharing the process-global single-thread pool. This change
+was tested separately against the otherwise identical candidate: all 36 PNG
+outputs matched exactly. It did not eliminate the timing regression below.
+
+First-load smoke measurements were run on this Windows PC through Docker
+Desktop Linux/amd64, with the same read-only six-file sample directory,
+lossless WebP, response caching disabled, four parallel batch requests and
+four OpenJPEG threads. Each column contains two passes (12 observations per
+scenario), summarized by the pooled median client-side time. Direct Grok and
+OpenJPEG baseline passes were interleaved; the final hybrid passes ran
+afterwards. The OS page cache was not flushed, other services remained on the
+host, and these timings must not be compared directly with ZimaBoard results.
+Every benchmark response returned HTTP 200.
+
+```text
+request                         auto 0.3.7   Grok 0.3.7   Grok 0.3.6   OpenJPEG 0.3.6
+full -> 512                        236.1 ms     306.1 ms     125.3 ms         94.4 ms
+full -> 1024                       463.3 ms     899.8 ms     408.0 ms        263.4 ms
+512 -> 128                          74.4 ms      71.4 ms      25.9 ms         41.3 ms
+4096 -> 512                        206.5 ms     274.1 ms     116.2 ms         95.5 ms
+advertised tile                     83.2 ms     242.3 ms     114.6 ms         71.8 ms
+startup batch, 512 -> 128           152.6 ms     169.2 ms     103.5 ms        126.1 ms
+startup viewport                   222.4 ms     602.4 ms     271.6 ms        236.9 ms
+prewarmed startup viewport         209.4 ms     620.7 ms     290.2 ms        239.1 ms
+```
+
+The direct Grok path regressed substantially in this initial comparison. The hybrid
+policy still avoids much of that cost for viewer tiles, but this is not a
+general speedup. Both the codec and Rust dependencies/compiler changed, so
+that run alone did not isolate the cause. Keep `auto` as the default and use
+the controlled follow-up below before promoting the candidate. Local JSON/CSV
+reports are under `target/bench-final-*` and pixel
+reports under `target/artifacts-037-*`; neither the reports nor source images
+are committed.
+
+A subsequent [controlled four-way investigation](docs/benchmarks/2026-10-22-grok.md)
+isolated the dominant difference to Grok's embedded Mercury path. Holding the
+compiler/runtime fixed, changing only the crates gave paired median decode-time
+ratios of 1.006 and 1.003; changing Grok gave ratios of 2.93 and 2.92. With the
+same Grok 20.4.19 binary and new crates, `GRK_MERCURY=0` restored approximately
+the previous performance. All 36 classic-Grok comparisons against the old Grok
+were pixel-identical, including a repeat on the original local 0.3.7 image.
+This remains Grok FFI, not OpenJPEG. The opt-out applies to the embedded Mercury
+backend, not just an external GPU plugin. No production default was changed;
+validate large masters and native Linux before promoting this setting.
+
+For the strict OpenJPEG comparison, use the six-file `$ids` list shown below
+and explicitly set the one-level tolerance:
+
+```powershell
+.\scripts\test-jp2-artifacts.ps1 -ImageIds $ids -IncludeFull512 `
+  -CandidateBaseUrl http://127.0.0.1:18116 -ReferenceBaseUrl http://127.0.0.1:18112 `
+  -MeanAbsThreshold 1 -BadPixelDelta 1 -BadPixelRatioThreshold 0
+```
+
+#### Previous ZimaBoard Runs
+
 Grok `20.4.15` was tested on 2026-10-05 for GigaTIFF `0.3.6`. All 60 Linux core/server
 unit tests passed with `jpeg2000-grok-ffi`. The six-file JP2 suite passed all 36 comparisons
 against OpenJPEG (maximum channel delta 1) and all 36 against Grok `20.4.12` with exact
@@ -1322,7 +1418,9 @@ Useful next steps for the image server:
 - preserve the tested hybrid `auto` policy and keep the CLI backend as a fallback build feature,
 - add CI artifact coverage for `gigatiff-server --features jpeg2000-grok-ffi` in a Linux container
   with representative reduced, full-resolution, small-tile, and 4096 px master requests,
-- extend the Grok 20.4.15/OpenJPEG benchmark across more archival masters, output sizes, and repeated
+- validate the measured `GRK_MERCURY=0` opt-out on large masters and native Linux, and profile
+  the embedded Mercury planning/decode path before promoting the local candidate,
+- extend the Grok 20.4.19/OpenJPEG benchmark across more archival masters, output sizes, and repeated
   warm-cache OpenSeadragon navigation before relaxing conservative backend routing,
 - tune the direct OpenJPEG FFI path further, especially adaptive thread count, reduction choice, and
   component conversion cost,
@@ -1346,9 +1444,8 @@ Useful next steps for the image server:
 
 Useful next release and deployment steps:
 
-- publish a Linux server Docker image after the Grok FFI CI path is stable,
+- publish the locally tested server candidate only after its Mercury policy is validated for deployment,
 - document the server support policy explicitly: native Linux first, Docker/Podman for other systems,
 - add Caddy auth/TLS examples for team sharing,
-- wire SBOM/provenance attestation upload into the release image workflow,
-- decide whether the next public version is a combined `0.3.0` release or separate Desktop/Server
-  version labels.
+- verify SBOM/provenance attestations for locally built images before registry publication,
+- retain separate stack and GigaTIFF version labels when promoting the next tested bundle.

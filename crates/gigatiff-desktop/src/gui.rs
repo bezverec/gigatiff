@@ -706,7 +706,11 @@ impl ViewerApp {
         ui.style_mut().spacing.scroll = previous_scroll_style;
 
         let old_center = (self.center_x, self.center_y);
-        self.set_center_from_scroll(&info, output.inner_rect.size(), output.state.offset);
+        self.set_center_from_scroll(
+            &info,
+            output.inner_rect.size(),
+            output.state.clamped_offset(),
+        );
         if (self.center_x - old_center.0).abs() > 0.01
             || (self.center_y - old_center.1).abs() > 0.01
         {
@@ -1104,7 +1108,7 @@ impl eframe::App for ViewerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
-        egui::Panel::top("toolbar").show_inside(ui, |ui| {
+        egui::Panel::top("toolbar").show(ui, |ui| {
             self.menu_bar(ui, &ctx);
             ui.separator();
 
@@ -1163,11 +1167,11 @@ impl eframe::App for ViewerApp {
             }
         });
 
-        egui::Panel::bottom("status_bar").show_inside(ui, |ui| {
+        egui::Panel::bottom("status_bar").show(ui, |ui| {
             self.status_bar(ui, &ctx);
         });
 
-        egui::CentralPanel::default().show_inside(ui, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             self.render_canvas(ui, &ctx);
         });
     }

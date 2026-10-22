@@ -40,7 +40,7 @@ pub fn render_region(
     set_stream_path(&mut stream, path)?;
     stream.is_read_stream = true;
 
-    let mut params = zeroed_decompress_parameters();
+    let mut params = single_thread_decompress_parameters();
     params.core.tile_cache_strategy = grk::GRK_TILE_CACHE_NONE;
     apply_rgb_upsample_to_params(&mut params);
 
@@ -110,10 +110,24 @@ fn zeroed_stream_params() -> grk::grk_stream_params {
     unsafe { std::mem::zeroed() }
 }
 
-fn zeroed_decompress_parameters() -> grk::grk_decompress_parameters {
+fn single_thread_decompress_parameters() -> grk::grk_decompress_parameters {
     // SAFETY: This mirrors Grok's CLI/default initialization pattern for
     // plain-old-data decoder parameters; fields are then set explicitly.
-    unsafe { std::mem::zeroed() }
+    let mut params: grk::grk_decompress_parameters = unsafe { std::mem::zeroed() };
+    // A per-codec inline executor keeps concurrent server requests independent
+    // of the single-threaded process-global Grok pool.
+    params.num_threads = 1;
+    params
+}
+
+#[cfg(test)]
+mod parameter_tests {
+    use super::single_thread_decompress_parameters;
+
+    #[test]
+    fn each_decoder_uses_its_own_single_thread_executor() {
+        assert_eq!(single_thread_decompress_parameters().num_threads, 1);
+    }
 }
 
 fn zeroed_header_info() -> grk::grk_header_info {

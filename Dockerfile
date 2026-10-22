@@ -1,11 +1,11 @@
 # syntax=docker/dockerfile:1
 
-ARG RUST_IMAGE=rust:1.98.1-trixie
-ARG DEBIAN_RUNTIME_IMAGE=debian:trixie-slim
+ARG RUST_IMAGE=rust:1.99.1-trixie
+ARG DEBIAN_RUNTIME_IMAGE=debian:trixie-20261020-slim
 FROM ${RUST_IMAGE} AS build
 
 ARG GROK_REPOSITORY=https://github.com/GrokImageCompression/grok.git
-ARG GROK_REF=v20.4.15
+ARG GROK_REF=v20.4.19
 ARG GIGATIFF_BUILD_GROK=1
 ARG GIGATIFF_SERVER_FEATURES=jpeg2000-grok-ffi
 ARG GIGATIFF_BUILD_JOBS=2
@@ -50,7 +50,14 @@ RUN if [ -n "${GIGATIFF_SERVER_FEATURES}" ]; then \
       cargo build --release --locked --jobs "${GIGATIFF_BUILD_JOBS}" -p gigatiff-server --bin gigatiff-server; \
     fi
 
-FROM ${DEBIAN_RUNTIME_IMAGE}
+FROM build AS verify
+
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    libasound2-dev libfontconfig1-dev libgl-dev libudev-dev libwayland-dev libx11-dev libxkbcommon-dev \
+  && rm -rf /var/lib/apt/lists/*
+RUN cargo test --locked --workspace --features gigatiff-server/jpeg2000-grok-ffi --jobs "${GIGATIFF_BUILD_JOBS}"
+
+FROM ${DEBIAN_RUNTIME_IMAGE} AS runtime
 
 LABEL org.opencontainers.image.title="GigaTIFF Server" \
       org.opencontainers.image.description="IIIF-compatible TIFF/BigTIFF/JPEG2000 image server" \
@@ -67,7 +74,12 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /srv/gigatiff
-COPY --from=build /usr/local /usr/local
+# Classic Grok avoids the embedded Mercury latency regression on the JP2 suite.
+# Override with -e GRK_MERCURY=1 to benchmark Mercury without rebuilding.
+ENV GRK_MERCURY=0
+COPY --from=build /usr/local/bin/ /usr/local/bin/
+COPY --from=build /usr/local/lib/ /usr/local/lib/
+COPY --from=build /usr/local/share/ /usr/local/share/
 COPY --from=build /app/target/release/gigatiff-server /usr/local/bin/gigatiff-server
 RUN ldconfig
 

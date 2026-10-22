@@ -6,6 +6,11 @@ license.workspace = true
 repository.workspace = true
 build = "build.rs"
 
+[[example]]
+name = "bench-grok"
+path = "examples/bench_grok.rs"
+required-features = ["jpeg2000-grok-ffi"]
+
 [features]
 default = []
 jpeg2000-grok-ffi = ["dep:grokj2k-sys"]

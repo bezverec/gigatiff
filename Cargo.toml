@@ -8,30 +8,30 @@ resolver = "3"
 exclude = ["vendor/grokj2k-sys"]
 
 [workspace.package]
-version = "0.3.6"
+version = "0.3.7"
 edition = "2024"
 license = "GPL-3.0-only"
 repository = "https://github.com/bezverec/gigatiff"
 
 [workspace.dependencies]
-anyhow = "1.0.102"
+anyhow = "1.0.104"
 axum = "0.8.9"
-clap = "4.6.1"
-eframe = "0.34.3"
+clap = "4.6.7"
+eframe = "0.37.0"
 grokj2k-sys = { path = "vendor/grokj2k-sys" }
 image = { version = "0.25.10", default-features = false }
-lcms2 = "6.1.1"
+lcms2 = "6.2.0"
 openjpeg-sys = "1.0.12"
 percent-encoding = "2.3.2"
 png = "0.18.1"
 rayon = "1.12.0"
-redis = "1.2.2"
+redis = "1.7.1"
 rfd = "0.17.2"
-serde = "1.0.228"
-serde_json = "1.0.150"
+serde = "1.0.229"
+serde_json = "1.0.154"
 tiff = "0.11.3"
-tokio = "1.52.3"
-tower-http = "0.6.11"
+tokio = "1.54.1"
+tower-http = "0.7.1"
 
 [profile.release]
 opt-level = 3
