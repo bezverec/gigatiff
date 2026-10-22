@@ -186,11 +186,14 @@ region/reduce fix and adds memory, thread-affinity, plugin-fallback and precinct
 from the 20.4.x series. Both FFI paths avoid spawning external
 codec processes or writing temporary PNM files.
 
-The `0.3.7` local candidate refreshes the Rust workspace dependencies and builds
+The `0.3.7` image refreshes the Rust workspace dependencies and builds
 with Rust `1.99.1` on Debian Trixie. The runtime uses the dated Debian image
 `trixie-20261020-slim` and copies Grok executables, libraries and shared resources,
-not the Rust toolchain or Cargo caches. This candidate has not been published to
-GHCR; `ghcr.io/bezverec/gigatiff-server:0.3.6` remains the latest published image.
+not the Rust toolchain or Cargo caches. The image is published as
+`ghcr.io/bezverec/gigatiff-server:0.3.7` for Linux `amd64`, with SBOM and provenance.
+Its immutable OCI index digest is
+`sha256:0fe6a79e7813886e134054cbcd83bca60c3bd953c4b7d15430227dd9957019b6`;
+the image source revision is `e55904db3c1160b047f8d7d41ee88b50c01e95a6`.
 The local Docker image size is about 167 MB, down from 1.20 GB for `0.3.6`
 (Docker-reported image size, not compressed registry transfer size).
 The image defaults to `GRK_MERCURY=0`: classic Grok FFI avoids the embedded
@@ -840,7 +843,7 @@ closest to the center of the viewport before filling edges and prefetching nearb
 
 ### Server Benchmarks
 
-#### Local 0.3.7 Candidate (2026-10-22)
+#### 0.3.7 Local Benchmarks (2026-10-22)
 
 The locally built candidate uses Grok `20.4.19`, Rust `1.99.1` and the refreshed
 workspace dependencies. All 67 Linux workspace tests passed: 13 core, 6 desktop
@@ -899,8 +902,10 @@ same Grok 20.4.19 binary and new crates, `GRK_MERCURY=0` restored approximately
 the previous performance. All 36 classic-Grok comparisons against the old Grok
 were pixel-identical, including a repeat on the original local 0.3.7 image.
 This remains Grok FFI, not OpenJPEG. The opt-out applies to the embedded Mercury
-backend, not just an external GPU plugin. No production default was changed;
-validate large masters and native Linux before promoting this setting.
+backend, not just an external GPU plugin. The published `0.3.7` container defaults
+to `GRK_MERCURY=0`; the initial table above records the earlier Mercury-enabled
+candidate, not the released container's default. Publishing did not change any
+deployed stack. Validate large masters and native Linux before broad deployment.
 
 For the strict OpenJPEG comparison, use the six-file `$ids` list shown below
 and explicitly set the one-level tolerance:
@@ -1419,7 +1424,7 @@ Useful next steps for the image server:
 - add CI artifact coverage for `gigatiff-server --features jpeg2000-grok-ffi` in a Linux container
   with representative reduced, full-resolution, small-tile, and 4096 px master requests,
 - validate the measured `GRK_MERCURY=0` opt-out on large masters and native Linux, and profile
-  the embedded Mercury planning/decode path before promoting the local candidate,
+  the embedded Mercury planning/decode path before broad production deployment,
 - extend the Grok 20.4.19/OpenJPEG benchmark across more archival masters, output sizes, and repeated
   warm-cache OpenSeadragon navigation before relaxing conservative backend routing,
 - tune the direct OpenJPEG FFI path further, especially adaptive thread count, reduction choice, and
@@ -1444,7 +1449,7 @@ Useful next steps for the image server:
 
 Useful next release and deployment steps:
 
-- publish the locally tested server candidate only after its Mercury policy is validated for deployment,
+- validate the published server image and Mercury policy on deployment-specific masters and concurrency,
 - document the server support policy explicitly: native Linux first, Docker/Podman for other systems,
 - add Caddy auth/TLS examples for team sharing,
 - verify SBOM/provenance attestations for locally built images before registry publication,
