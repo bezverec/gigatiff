@@ -193,6 +193,10 @@ It passed 67 Linux workspace tests and 280 full-pixel RGBA comparisons across
 six JP2 regressions and an uncompressed RGB8 TIFF. The tested outputs are
 pixel-exact against `0.3.7`; no material aggregate HTTP latency change was
 measured. See the [release verification and benchmarks](docs/benchmarks/2026-11-11-grok.md).
+The public Linux `amd64` image is `ghcr.io/bezverec/gigatiff-server:0.3.8`,
+with SPDX SBOM and SLSA provenance. Its immutable OCI index digest is
+`sha256:ec53ca6139feee7d65743937fc74931220faf2d7a42adf8c4187af065528a9a5`;
+the image source revision is `d75c529e2178b3985672285b7a20ef0517950425`.
 An expanded test also reproduced a pre-existing compressed-TIFF limitation:
 sampled/offset reads inside a multi-row LZW strip can fail with
 `Compression algorithm does not support random access`. This release does
