@@ -179,14 +179,26 @@ Grok is AGPL-licensed, so this backend is kept server-only and optional in Cargo
 The Docker image enables `jpeg2000-grok-ffi`, which includes both the direct Grok FFI backend and
 the direct OpenJPEG FFI backend. The production default is the hybrid `auto` mode: Grok handles
 reduced JP2 regions, while OpenJPEG handles full-resolution requests and large-tile master files;
-either backend can also be selected explicitly. Docker builds pin Grok to upstream release `v20.4.19`
-(annotated tag `6bc4e60c1c32c205705c8c67126babb157b17f16`, source commit
-`31ae6fa25be3747370b47a65d311e355f2adb33f`), which retains the lossy RPCL
+either backend can also be selected explicitly. Docker builds pin Grok to upstream release `v20.4.25`
+(annotated tag `ec841d383151c16f060d12c4f645193ca96bdbef`, source commit
+`46ab34dee9590dcd97026e40e9ecd9383706bcad`), which retains the lossy RPCL
 region/reduce fix and adds memory, thread-affinity, plugin-fallback and precinct-intersection fixes
 from the 20.4.x series. Both FFI paths avoid spawning external
 codec processes or writing temporary PNM files.
 
-The `0.3.7` image refreshes the Rust workspace dependencies and builds
+The `0.3.8` release updates Grok to `20.4.25` without changing the hybrid
+`auto` policy or the classic-Grok `GRK_MERCURY=0` default. The z2000 benchmark
+adapter remains a separate local experiment and is not included in this release.
+It passed 67 Linux workspace tests and 280 full-pixel RGBA comparisons across
+six JP2 regressions and an uncompressed RGB8 TIFF. The tested outputs are
+pixel-exact against `0.3.7`; no material aggregate HTTP latency change was
+measured. See the [release verification and benchmarks](docs/benchmarks/2026-11-11-grok.md).
+An expanded test also reproduced a pre-existing compressed-TIFF limitation:
+sampled/offset reads inside a multi-row LZW strip can fail with
+`Compression algorithm does not support random access`. This release does
+not fix that core-renderer issue; it is separate from the Grok upgrade.
+
+The previously published `0.3.7` image refreshes the Rust workspace dependencies and builds
 with Rust `1.99.1` on Debian Trixie. The runtime uses the dated Debian image
 `trixie-20261020-slim` and copies Grok executables, libraries and shared resources,
 not the Rust toolchain or Cargo caches. The image is published as
@@ -208,7 +220,7 @@ For a fully local build and full workspace test run:
 docker buildx build --target verify --output type=cacheonly `
   --build-arg GIGATIFF_BUILD_JOBS=4 .
 docker build --pull --build-arg GIGATIFF_BUILD_JOBS=4 `
-  -t localhost/gigatiff-server:0.3.7 -t gigatiff-server:local .
+  -t localhost/gigatiff-server:0.3.8 -t gigatiff-server:local .
 ```
 
 The server stores encoded IIIF region/tile responses in a persistent cache. By default this is the
@@ -1425,8 +1437,9 @@ Useful next steps for the image server:
   with representative reduced, full-resolution, small-tile, and 4096 px master requests,
 - validate the measured `GRK_MERCURY=0` opt-out on large masters and native Linux, and profile
   the embedded Mercury planning/decode path before broad production deployment,
-- extend the Grok 20.4.19/OpenJPEG benchmark across more archival masters, output sizes, and repeated
+- extend the Grok 20.4.25/OpenJPEG benchmark across more archival masters, output sizes, and repeated
   warm-cache OpenSeadragon navigation before relaxing conservative backend routing,
+- fix and add regression coverage for nonsequential scanline reads in compressed multi-row TIFF strips,
 - tune the direct OpenJPEG FFI path further, especially adaptive thread count, reduction choice, and
   component conversion cost,
 - add earlier first-load prewarm triggers for the web UI, starting with image-list hover/focus and an
